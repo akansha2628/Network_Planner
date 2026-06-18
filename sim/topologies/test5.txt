@@ -1,0 +1,36 @@
+# TEST-5 Network Topology Configuration
+# A simple 5-node network topology for testing and debugging
+
+NAME=TEST-5
+N=5
+LINKS=7
+
+# Topology adjacency matrix (N x N)
+# TOPOLOGY[i][j] = 1 indicates a link between nodes i and j
+# TOPOLOGY[i][j] = 0 indicates no link between nodes i and j
+TOPOLOGY
+0,1,1,0,0
+1,0,1,1,0
+1,1,0,1,1
+0,1,1,0,1
+0,0,1,1,0
+
+# Link lengths matrix (N x N)
+# TOPOLOGY_LINK_LENGTHS[i][j] contains the length of the link between nodes i and j
+# 0 if no link exists between two nodes
+TOPOLOGY_LINK_LENGTHS
+0,120,200,0,0
+120,0,150,100,0
+200,150,0,180,220
+0,100,180,0,140
+0,0,220,140,0
+
+# Link index matrix (N x N)
+# LINK_INDEX[i][j] contains the index of the link between nodes i and j
+# -1 if no link exists between two nodes
+LINK_INDEX
+-1,0,1,-1,-1
+0,-1,2,3,-1
+1,2,-1,4,5
+-1,3,4,-1,6
+-1,-1,5,6,-1

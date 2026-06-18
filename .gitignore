@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Simulation outputs
+blocking_results.csv
+final_state.pkl
+simulation_snapshot.pkl
+blocking_plot.png
+simulation_log.txt
+simulation_console_output.txt
+*.pkl
+*.csv
+
+# Results directory
+results/
+*.log
+*.png
+*.csv
+*.pkl
+__pycache__/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+/tmp/
+*.tmp
