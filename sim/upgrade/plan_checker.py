@@ -180,6 +180,7 @@ def _compute_cycle_budget_components(current_time, budget_params=None, budget_tr
     )
 
 
+
 def _commit_budget_usage(current_time, budget_tracker, projected_cycle_opex, total_capex_workforce, label="FINAL COMMIT"):
     """
     Commit budget usage exactly once, after the final accepted plan is chosen.
@@ -516,6 +517,29 @@ def _try_strengthen_kept_decisions_with_remaining_budget(
         best_cost_summary,
         best_cost_details,
     )
+
+# def _compute_cycle_budget_components(current_time, current_link_status_forward, budget_params=None):
+#     """
+#     Returns budgets for the current cycle:
+#       - OPEX budget
+#       - CAPEX + workforce budget
+#       - TOTAL budget
+#     """
+#     if budget_params is None:
+#         raise ValueError("budget_params cannot be None")
+#
+#     period_days = int(budget_params["period_days"])
+#     inflation_rate = float(budget_params["inflation_rate"])
+#
+#     period_idx = int(current_time // period_days)
+#     growth = (1.0 + inflation_rate) ** period_idx
+#
+#     current_opex_budget = float(budget_params["period_opex_budget_0"]) * growth
+#     current_capex_budget = float(budget_params["period_capex_budget_0"]) * growth
+#     current_total_budget = float(budget_params["period_total_budget_0"]) * growth
+#
+#     return current_opex_budget, current_capex_budget, current_total_budget
+
 
 def _compute_total_downtime(cum_upgrade_decisions, algorithm_name):
     """
@@ -1744,6 +1768,65 @@ def plan_checker(
 
     return False, list(kept_decisions.keys()), kept_decisions
 
+    # print("↺ Trying fallback: lighter-upgrade links first...")
+    #
+    # (
+    #     fallback_ok,
+    #     fallback_links,
+    #     fallback_decisions,
+    #     fallback_bp,
+    #     fallback_projected_cycle_opex,
+    #     fallback_total_capex_workforce,
+    #     fallback_total_downtime,
+    #     fallback_opex_ok,
+    #     fallback_capex_ok,
+    #     fallback_total_ok,
+    #     fallback_time_ok,
+    # ) = _run_fallback_light_links_first(
+    #     link_rows=link_rows,
+    #     current_time=current_time,
+    #     current_link_status_forward=current_link_status_forward,
+    #     current_link_status_backward=current_link_status_backward,
+    #     PATHS=PATHS,
+    #     traffic_base=traffic_base,
+    #     seed=seed,
+    #     algorithm=algorithm,
+    #     budget_params=budget_params,
+    #     budget_selection_mode=budget_selection_mode,
+    #     budget_tracker=budget_tracker,
+    # )
+    #
+    # if fallback_ok:
+    #     print("✅ PLAN CHECKER PASSED — fallback kept set satisfies performance and constraints.")
+    #
+    #     _append_plan_checker_log_row(
+    #         current_time=current_time,
+    #         status="PASS",
+    #         reason="Fallback lighter-link set satisfies performance and constraints",
+    #         baseline_bp=fallback_bp,
+    #         threshold=blocked_connection_prob_threshold_plan_checker,
+    #         selected_links=passed_links,
+    #         kept_links=fallback_links,
+    #         projected_cycle_opex=fallback_projected_cycle_opex,
+    #         total_capex_workforce=fallback_total_capex_workforce,
+    #         total_downtime=fallback_total_downtime,
+    #         opex_ok=fallback_opex_ok,
+    #         capex_ok=fallback_capex_ok,
+    #         total_ok=fallback_total_ok,
+    #         time_ok=fallback_time_ok,
+    #     )
+    #
+    #     if budget_selection_mode == "budget_aware":
+    #         _commit_budget_usage(
+    #             current_time=current_time,
+    #             budget_tracker=budget_tracker,
+    #             projected_cycle_opex=fallback_projected_cycle_opex,
+    #             total_capex_workforce=fallback_total_capex_workforce,
+    #             label="FALLBACK COMMIT"
+    #         )
+    #
+    #     return True, fallback_links, fallback_decisions
+
     _append_plan_checker_log_row(
         current_time=current_time,
         status="FAIL",
@@ -1763,3 +1846,3109 @@ def plan_checker(
     return False, list(kept_decisions.keys()), kept_decisions
 
 
+# import copy
+# import csv
+# import random
+# from pathlib import Path
+#
+# from sim.core import topology as Topology
+# from sim.upgrade.upgrade_manager import (
+#     reset_all_slots_empty,
+#     perform_upgrade,
+#     choose_upgrade_type,
+# )
+# from sim.upgrade.cost_model import compute_upgrade_costs
+# from sim.routing.rsa import execute_first_fit
+# from sim.core.traffic_generator import NetworkTrafficGenerator
+# from sim.core.constants import *
+# from sim.upgrade.opex_model import compute_network_opex_per_day
+# from sim.core import blocked_connection_prob_threshold_plan_checker
+#
+#
+# # =====================================================================
+# # Logging helpers
+# # =====================================================================
+#
+# def _get_plan_checker_log_path() -> Path:
+#     return Path("results") / "plan_checker_log.csv"
+#
+#
+# def _init_plan_checker_log_if_needed():
+#     log_path = _get_plan_checker_log_path()
+#     if not log_path.exists():
+#         log_path.parent.mkdir(parents=True, exist_ok=True)
+#         with open(log_path, "w", newline="", encoding="utf-8") as f:
+#             writer = csv.writer(f)
+#             writer.writerow([
+#                 "time_day",
+#                 "status",
+#                 "reason",
+#                 "baseline_bp",
+#                 "threshold",
+#                 "selected_links",
+#                 "kept_links",
+#                 "projected_cycle_opex",
+#                 "total_capex_workforce",
+#                 "total_downtime",
+#                 "opex_ok",
+#                 "capex_ok",
+#                 "total_ok",
+#                 "time_ok",
+#             ])
+#
+#
+# def _append_plan_checker_log_row(
+#     current_time,
+#     status,
+#     reason,
+#     baseline_bp,
+#     threshold,
+#     selected_links,
+#     kept_links,
+#     projected_cycle_opex="",
+#     total_capex_workforce="",
+#     total_downtime="",
+#     opex_ok="",
+#     capex_ok="",
+#     total_ok="",
+#     time_ok="",
+# ):
+#     _init_plan_checker_log_if_needed()
+#     with open(_get_plan_checker_log_path(), "a", newline="", encoding="utf-8") as f:
+#         writer = csv.writer(f)
+#         writer.writerow([
+#             current_time,
+#             status,
+#             reason,
+#             baseline_bp,
+#             threshold,
+#             list(selected_links) if selected_links is not None else [],
+#             list(kept_links) if kept_links is not None else [],
+#             projected_cycle_opex,
+#             total_capex_workforce,
+#             total_downtime,
+#             opex_ok,
+#             capex_ok,
+#             total_ok,
+#             time_ok,
+#         ])
+#
+#
+# # =====================================================================
+# # Downtime / cost / budget helpers
+# # =====================================================================
+#
+# def _get_upgrade_downtime_days_local(dec, algorithm_name):
+#     """
+#     Local downtime mapping so plan_checker.py does not depend on a helper
+#     hidden elsewhere.
+#     """
+#     if dec is None:
+#         return 0.0
+#
+#     utype = dec.get("upgrade_type")
+#
+#     if utype == "new_fiber_C":
+#         return float(t_C1)
+#     if utype == "new_fiber_CL":
+#         return float(t_CL1)
+#     if utype == "band_upgrade":
+#         return float(t_b)
+#     if utype == "core_upgrade":
+#         return float(t_3C)
+#
+#     return 0.0
+#
+#
+# def _compute_cycle_budget_components(current_time, current_link_status_forward, budget_params=None):
+#     """
+#     Returns budgets for the current cycle:
+#       - OPEX budget
+#       - CAPEX + workforce budget
+#       - TOTAL budget
+#     """
+#     if budget_params is None:
+#         raise ValueError("budget_params cannot be None")
+#
+#     period_days = int(budget_params["period_days"])
+#     inflation_rate = float(budget_params["inflation_rate"])
+#
+#     period_idx = int(current_time // period_days)
+#     growth = (1.0 + inflation_rate) ** period_idx
+#
+#     current_opex_budget = float(budget_params["period_opex_budget_0"]) * growth
+#     current_capex_budget = float(budget_params["period_capex_budget_0"]) * growth
+#     current_total_budget = float(budget_params["period_total_budget_0"]) * growth
+#
+#     return current_opex_budget, current_capex_budget, current_total_budget
+#
+#
+# def _compute_total_downtime(cum_upgrade_decisions, algorithm_name):
+#     """
+#     Sum downtime over all upgrade decisions on all selected links.
+#     """
+#     total_downtime = 0.0
+#
+#     for _, decs in cum_upgrade_decisions.items():
+#         if decs is None:
+#             continue
+#
+#         if isinstance(decs, dict):
+#             decs = [decs]
+#
+#         for dec in decs:
+#             total_downtime += _get_upgrade_downtime_days_local(dec, algorithm_name)
+#
+#     return total_downtime
+#
+#
+# def _compute_total_capex_workforce(cum_upgrade_decisions, algorithm_name):
+#     """
+#     Compute total equipment + workforce cost for the cumulative selected set.
+#     """
+#     safe_links_for_upgrade = list(cum_upgrade_decisions.keys())
+#
+#     if not safe_links_for_upgrade:
+#         return 0.0, {"equipment_total": 0.0, "workforce_total": 0.0}, {}
+#
+#     total_cost, cost_summary, cost_details = compute_upgrade_costs(
+#         safe_links_for_upgrade=safe_links_for_upgrade,
+#         upgrade_decisions=cum_upgrade_decisions,
+#         algorithm_name=algorithm_name
+#     )
+#
+#     total_capex_workforce = (
+#         float(cost_summary.get("equipment_total", 0.0))
+#         + float(cost_summary.get("workforce_total", 0.0))
+#     )
+#
+#     return total_capex_workforce, cost_summary, cost_details
+#
+#
+# def _compute_projected_cycle_opex(cum_forward):
+#     """
+#     Compute projected OPEX for one upgrade-initiation cycle under the
+#     currently selected upgraded state.
+#     """
+#     daily_opex = float(compute_network_opex_per_day(cum_forward))
+#     period_opex = daily_opex * float(Upgrade_initiation_days)
+#     return daily_opex, period_opex
+#
+#
+# def _constraints_ok(
+#     cum_upgrade_decisions,
+#     cum_forward,
+#     current_time,
+#     current_link_status_forward,
+#     algorithm_name,
+#     budget_params=None
+# ):
+#     """
+#     Check all constraints:
+#       - OPEX budget
+#       - CAPEX + workforce budget
+#       - TOTAL budget
+#       - Total downtime
+#     """
+#     total_capex_workforce, cost_summary, cost_details = _compute_total_capex_workforce(
+#         cum_upgrade_decisions,
+#         algorithm_name
+#     )
+#
+#     total_downtime = _compute_total_downtime(cum_upgrade_decisions, algorithm_name)
+#
+#     daily_opex, projected_cycle_opex = _compute_projected_cycle_opex(cum_forward)
+#
+#     current_opex_budget, current_capex_budget, current_total_budget = _compute_cycle_budget_components(
+#         current_time,
+#         current_link_status_forward,
+#         budget_params
+#     )
+#
+#     total_projected_spending = projected_cycle_opex + total_capex_workforce
+#
+#     opex_ok = projected_cycle_opex <= current_opex_budget
+#     capex_ok = total_capex_workforce <= current_capex_budget
+#     total_ok = total_projected_spending <= current_total_budget
+#     time_ok = total_downtime <= Upgrade_initiation_days
+#
+#     print(f"   → Daily OPEX under current upgraded state: {daily_opex:.2f}")
+#     print(f"   → Projected OPEX for this {Upgrade_initiation_days}-day cycle: {projected_cycle_opex:.2f}")
+#     print(f"   → OPEX budget for cycle: {current_opex_budget:.2f}")
+#     print(f"   → CAPEX + Workforce spent: {total_capex_workforce:.2f}")
+#     print(f"   → CAPEX + Workforce budget for cycle: {current_capex_budget:.2f}")
+#     print(f"   → Total projected spending this cycle: {total_projected_spending:.2f}")
+#     print(f"   → Total budget for cycle: {current_total_budget:.2f}")
+#     print(f"   → Total downtime: {total_downtime:.2f} days")
+#     print(f"   → OPEX constraint: {'PASS' if opex_ok else 'FAIL'}")
+#     print(f"   → CAPEX/WF constraint: {'PASS' if capex_ok else 'FAIL'}")
+#     print(f"   → TOTAL budget constraint: {'PASS' if total_ok else 'FAIL'}")
+#     print(f"   → Time constraint: {'PASS' if time_ok else 'FAIL'}")
+#
+#     return (
+#         opex_ok,
+#         capex_ok,
+#         total_ok,
+#         time_ok,
+#         projected_cycle_opex,
+#         total_capex_workforce,
+#         total_downtime,
+#         cost_summary,
+#         cost_details
+#     )
+#
+#
+# def _canonicalize_link_decisions(dec_list):
+#     """
+#     Clean one link's ordered decision list.
+#
+#     Rules:
+#       1) remove invalid decisions
+#       2) merge consecutive:
+#             new_fiber_C(f) + band_upgrade(f) -> new_fiber_CL(f)
+#       3) if a core_upgrade exists, drop everything before the first core_upgrade
+#          but keep core_upgrade and all later steps
+#     """
+#     if not dec_list:
+#         return []
+#
+#     # keep only valid decisions
+#     cleaned = [d for d in dec_list if d is not None and d.get("upgrade_type") is not None]
+#     if not cleaned:
+#         return []
+#
+#     # merge new_fiber_C + band_upgrade on same fiber -> new_fiber_CL
+#     merged = []
+#     i = 0
+#     while i < len(cleaned):
+#         d1 = cleaned[i]
+#
+#         if i + 1 < len(cleaned):
+#             d2 = cleaned[i + 1]
+#
+#             if (
+#                 d1.get("upgrade_type") == "new_fiber_C"
+#                 and d2.get("upgrade_type") == "band_upgrade"
+#                 and d1.get("fiber_id") == d2.get("fiber_id")
+#             ):
+#                 merged.append({
+#                     "upgrade_type": "new_fiber_CL",
+#                     "fiber_id": d1.get("fiber_id"),
+#                     "core_type": d1.get("core_type"),
+#                 })
+#                 i += 2
+#                 continue
+#
+#         merged.append(d1)
+#         i += 1
+#
+#     # if core_upgrade exists, drop everything before the first one
+#     core_idx = None
+#     for idx, d in enumerate(merged):
+#         if d.get("upgrade_type") == "core_upgrade":
+#             core_idx = idx
+#             break
+#
+#     if core_idx is not None:
+#         merged = merged[core_idx:]
+#
+#     return merged
+#
+#
+# def _normalize_upgrade_decisions(upgrade_decisions):
+#     """
+#     Normalize and canonicalize per-link decision lists.
+#     """
+#     normalized = {}
+#
+#     for link, decs in upgrade_decisions.items():
+#         if decs is None:
+#             continue
+#
+#         if isinstance(decs, dict):
+#             decs = [decs]
+#
+#         canonical = _canonicalize_link_decisions(list(decs))
+#
+#         if canonical:
+#             normalized[link] = canonical
+#
+#     return normalized
+#
+#
+# def _compute_single_link_capex_workforce(link_id, link_decisions, algorithm_name):
+#     """
+#     Compute equipment + workforce for one link's already-decided upgrade list.
+#     """
+#     total_cost, cost_summary, cost_details = compute_upgrade_costs(
+#         safe_links_for_upgrade=[link_id],
+#         upgrade_decisions={link_id: link_decisions},
+#         algorithm_name=algorithm_name
+#     )
+#
+#     return (
+#         float(cost_summary.get("equipment_total", 0.0))
+#         + float(cost_summary.get("workforce_total", 0.0))
+#     )
+#
+#
+# # =====================================================================
+# # Blocking simulation
+# # =====================================================================
+#
+# def run_planchecker_simulation(
+#     forward_status_pc,
+#     backward_status_pc,
+#     traffic_matrix_pc,
+#     PATHS,
+#     start_time_pc,
+#     seed
+# ):
+#     """
+#     Boolean pass/fail wrapper retained for compatibility.
+#     """
+#     bp = evaluate_blocking_probability(
+#         forward_status_pc=forward_status_pc,
+#         backward_status_pc=backward_status_pc,
+#         traffic_matrix_pc=traffic_matrix_pc,
+#         PATHS=PATHS,
+#         start_time_pc=start_time_pc,
+#         seed=seed
+#     )
+#     return bp <= blocked_connection_prob_threshold_plan_checker
+#
+#
+# def evaluate_blocking_probability(
+#     forward_status_pc,
+#     backward_status_pc,
+#     traffic_matrix_pc,
+#     PATHS,
+#     start_time_pc,
+#     seed
+# ):
+#     """
+#     Runs a projection-window traffic simulation and returns blocking probability.
+#     """
+#     testing_topology = Topology.TOPOLOGY
+#
+#     # Project ahead by one upgrade cycle, then test for one traffic-growth window
+#     start_pc = start_time_pc + Upgrade_initiation_days
+#     current_time_pc = start_pc
+#     SIM_END_pc = start_pc + Traffic_growth_days
+#
+#     pc_rng = random.Random(seed + 5555)
+#
+#     tg_pc = NetworkTrafficGenerator(
+#         number_of_nodes=Topology.N,
+#         datarates=DATARATE,
+#         lambda_0=lambda_0,
+#         mean_holding_time=MEAN_HOLDING_TIME,
+#         Current_global_time=start_pc,
+#         rng=pc_rng
+#     )
+#
+#     ALL_DEMANDS_PLAN_CHECKER = []
+#     blocked_pc = 0
+#     total_pc = 0
+#     next_growth_time_pc = start_pc + Traffic_growth_days
+#
+#     while True:
+#         while current_time_pc >= next_growth_time_pc:
+#             for i in range(Topology.N):
+#                 for j in range(Topology.N):
+#                     if i != j:
+#                         growth = 1 + pc_rng.uniform(0, alpha / 100)
+#                         traffic_matrix_pc[i][j] *= growth
+#                         traffic_matrix_pc[i][j] *= (1 + delta / 100)
+#             next_growth_time_pc += Traffic_growth_days
+#
+#         src_pc, dest_pc, rate_pc = tg_pc.generate_connection_data()
+#         lam = traffic_matrix_pc[src_pc][dest_pc]
+#         arrival_time_pc, holding_time_pc = tg_pc.get_connection(lam)
+#         current_time_pc = arrival_time_pc
+#
+#         if current_time_pc >= SIM_END_pc:
+#             break
+#
+#         departure_time_pc = arrival_time_pc + holding_time_pc
+#         total_pc += 1
+#
+#         index_to_remove_plan_checker = []
+#
+#         for idp, conn_pc in enumerate(ALL_DEMANDS_PLAN_CHECKER):
+#             if conn_pc.departure_time_pc <= current_time_pc:
+#                 index_to_remove_plan_checker.append(idp)
+#
+#         for idp in reversed(index_to_remove_plan_checker):
+#             conn_pc = ALL_DEMANDS_PLAN_CHECKER[idp]
+#
+#             for i in range(len(conn_pc.path_pc) - 1):
+#                 src_depart = conn_pc.path_pc[i]
+#                 dest_depart = conn_pc.path_pc[i + 1]
+#
+#                 link_pc = conn_pc.link_ids_pc[i]
+#                 fiber_pc = conn_pc.fibers_used_pc[i]
+#                 core_pc = conn_pc.cores_used_pc[i]
+#
+#                 if src_depart < dest_depart:
+#                     if link_pc in forward_status_pc and fiber_pc in forward_status_pc[link_pc]:
+#                         fwd_obj = forward_status_pc[link_pc][fiber_pc]
+#
+#                         if isinstance(fwd_obj, dict) and "slots" in fwd_obj:
+#                             for s in range(conn_pc.fs_pc, conn_pc.fs_pc + conn_pc.sw_pc):
+#                                 fwd_obj["slots"][s] = 0
+#                         else:
+#                             if core_pc in fwd_obj:
+#                                 for s in range(conn_pc.fs_pc, conn_pc.fs_pc + conn_pc.sw_pc):
+#                                     fwd_obj[core_pc]["slots"][s] = 0
+#                 else:
+#                     if link_pc in backward_status_pc and fiber_pc in backward_status_pc[link_pc]:
+#                         bwd_obj = backward_status_pc[link_pc][fiber_pc]
+#
+#                         if isinstance(bwd_obj, dict) and "slots" in bwd_obj:
+#                             for s in range(conn_pc.fs_pc, conn_pc.fs_pc + conn_pc.sw_pc):
+#                                 bwd_obj["slots"][s] = 0
+#                         else:
+#                             if core_pc in bwd_obj:
+#                                 for s in range(conn_pc.fs_pc, conn_pc.fs_pc + conn_pc.sw_pc):
+#                                     bwd_obj[core_pc]["slots"][s] = 0
+#
+#             del ALL_DEMANDS_PLAN_CHECKER[idp]
+#
+#         mf_pc, fs_pc, sw_pc, path_pc, fibers_used_pc, cores_used_pc, link_ids_pc, attempted_paths_info_pc = execute_first_fit(
+#             src=src_pc,
+#             dest=dest_pc,
+#             datarate=rate_pc,
+#             arrival_time=arrival_time_pc,
+#             departure_time=departure_time_pc,
+#             link_status_forward=forward_status_pc,
+#             link_status_backward=backward_status_pc,
+#             topology=testing_topology,
+#             PATHS=PATHS
+#         )
+#
+#         if mf_pc == float("inf") or fs_pc == float("inf"):
+#             blocked_pc += 1
+#         else:
+#             ALL_DEMANDS_PLAN_CHECKER.append(
+#                 ConnectionData_plan_checker(
+#                     path_pc, link_ids_pc, fs_pc, sw_pc, mf_pc,
+#                     arrival_time_pc, holding_time_pc, departure_time_pc,
+#                     rate_pc, fibers_used_pc, cores_used_pc
+#                 )
+#             )
+#
+#     blocking_probability_pc = (blocked_pc / total_pc) if total_pc > 0 else 1.0
+#
+#     print(f"   → Total requests tested: {total_pc}")
+#     print(f"   → Blocked connections: {blocked_pc}")
+#     print(f"   → Blocking probability: {blocking_probability_pc:.4f}")
+#
+#     return blocking_probability_pc
+#
+#
+# def plan_checker(
+#         safe_links,
+#         upgrade_decisions,
+#         current_time,
+#         PATHS,
+#         current_traffic,
+#         current_link_status_forward,
+#         current_link_status_backward,
+#         seed,
+#         algorithm,
+#         budget_params=None
+# ):
+#     print("\n▶ RUNNING PLAN CHECKER...")
+#
+#     # ------------------------------------------------------------
+#     # Step 0: normalize decisions from main.py
+#     # ------------------------------------------------------------
+#     full_decisions = _normalize_upgrade_decisions(upgrade_decisions)
+#
+#     if not full_decisions:
+#         print("❌ No valid upgrade decisions received.")
+#         _append_plan_checker_log_row(
+#             current_time=current_time,
+#             status="FAIL",
+#             reason="No valid upgrade decisions received",
+#             baseline_bp="",
+#             threshold=blocked_connection_prob_threshold_plan_checker,
+#             selected_links=[],
+#             kept_links=[]
+#         )
+#         return False, {}
+#
+#     # Keep input ordering from main.py
+#     full_links = [lid for lid in safe_links if lid in full_decisions]
+#     if not full_links:
+#         full_links = list(full_decisions.keys())
+#
+#     # ------------------------------------------------------------
+#     # Step 1: create cumulative state from initial decisions
+#     # ------------------------------------------------------------
+#     cum_forward = copy.deepcopy(current_link_status_forward)
+#     cum_backward = copy.deepcopy(current_link_status_backward)
+#     cum_forward, cum_backward = reset_all_slots_empty(cum_forward, cum_backward)
+#
+#     perform_upgrade(
+#         full_links,
+#         full_decisions,
+#         cum_forward,
+#         cum_backward,
+#         C_BAND_SLOTS,
+#         TOTAL_SLOTS,
+#         current_time,
+#         algorithm
+#     )
+#     print("✓ Applied full candidate upgrade set from main.py")
+#
+#     # project traffic one cycle ahead
+#     traffic_base = current_traffic.copy()
+#     steps = int(Upgrade_initiation_days / Traffic_growth_days)
+#     growth_factor_pc = ((1 + alpha / 100) * (1 + delta / 100)) ** steps
+#     traffic_base *= growth_factor_pc
+#
+#     print(f"✓ Traffic projected +{Upgrade_initiation_days} days ahead")
+#
+#     # cumulative decisions that may grow in progressive rounds
+#     cum_upgrade_decisions = copy.deepcopy(full_decisions)
+#
+#     # ------------------------------------------------------------
+#     # Step 2: progressive multi-round escalation if performance fails
+#     # ------------------------------------------------------------
+#     round_idx = 0
+#
+#     while True:
+#         baseline_bp = evaluate_blocking_probability(
+#             forward_status_pc=copy.deepcopy(cum_forward),
+#             backward_status_pc=copy.deepcopy(cum_backward),
+#             traffic_matrix_pc=traffic_base.copy(),
+#             PATHS=PATHS,
+#             start_time_pc=current_time,
+#             seed=seed
+#         )
+#
+#         print(f"✓ Current cumulative blocking probability = {baseline_bp:.6f}")
+#
+#         if baseline_bp <= blocked_connection_prob_threshold_plan_checker:
+#             print("\n" + "-" * 80)
+#             print("✓ PLAN CHECKER: PERFORMANCE PASSES")
+#             print("-" * 80)
+#             print(f"→ Current day        : {current_time}")
+#             print(f"→ Blocking           : {baseline_bp:.6f}")
+#             print(f"→ Threshold          : {blocked_connection_prob_threshold_plan_checker:.6f}")
+#             print(f"→ Candidate links    : {list(cum_upgrade_decisions.keys())}")
+#             print("-" * 80 + "\n")
+#             break
+#
+#         # performance failed -> log and escalate one more round for all links
+#         round_idx += 1
+#         print("\n" + "=" * 80)
+#         print(f"❌ PLAN CHECKER PERFORMANCE FAILED — STARTING ROUND #{round_idx} ESCALATION")
+#         print("=" * 80)
+#         print(f"→ Current simulation day           : {current_time}")
+#         print(f"→ Blocking threshold               : {blocked_connection_prob_threshold_plan_checker:.6f}")
+#         print(f"→ Achieved blocking                : {baseline_bp:.6f}")
+#         print("→ Escalating next upgrade decision for all eligible links")
+#         print("=" * 80 + "\n")
+#
+#         round_upgrades = {}
+#
+#         for link in full_links:
+#             upg = choose_upgrade_type(
+#                 link,
+#                 cum_forward,
+#                 cum_backward,
+#                 algorithm
+#             )
+#
+#             if upg is None or upg.get("upgrade_type") is None:
+#                 continue
+#
+#             round_upgrades[link] = upg
+#
+#         if not round_upgrades:
+#             print("⚠️ No further upgrades possible on any selected link.")
+#             _append_plan_checker_log_row(
+#                 current_time=current_time,
+#                 status="FAIL",
+#                 reason="Performance failed and no further upgrades possible",
+#                 baseline_bp=baseline_bp,
+#                 threshold=blocked_connection_prob_threshold_plan_checker,
+#                 selected_links=list(cum_upgrade_decisions.keys()),
+#                 kept_links=[]
+#             )
+#             return False, cum_upgrade_decisions
+#
+#         print(f"✓ Selected next upgrades for {len(round_upgrades)} links in escalation round #{round_idx}")
+#
+#         for link, upg in round_upgrades.items():
+#             if link not in cum_upgrade_decisions:
+#                 cum_upgrade_decisions[link] = []
+#             elif isinstance(cum_upgrade_decisions[link], dict):
+#                 cum_upgrade_decisions[link] = [cum_upgrade_decisions[link]]
+#             elif cum_upgrade_decisions[link] is None:
+#                 cum_upgrade_decisions[link] = []
+#
+#             cum_upgrade_decisions[link].append(upg)
+#
+#             # IMPORTANT:
+#             # Immediately canonicalize after appending, so:
+#             #   new_fiber_C + band_upgrade on same fiber -> new_fiber_CL
+#             #   anything before core_upgrade is removed
+#             cum_upgrade_decisions[link] = _canonicalize_link_decisions(cum_upgrade_decisions[link])
+#
+#         # rebuild cumulative network state cleanly from scratch
+#         cum_forward = copy.deepcopy(current_link_status_forward)
+#         cum_backward = copy.deepcopy(current_link_status_backward)
+#         cum_forward, cum_backward = reset_all_slots_empty(cum_forward, cum_backward)
+#
+#         perform_upgrade(
+#             list(cum_upgrade_decisions.keys()),
+#             cum_upgrade_decisions,
+#             cum_forward,
+#             cum_backward,
+#             C_BAND_SLOTS,
+#             TOTAL_SLOTS,
+#             current_time,
+#             algorithm
+#         )
+#
+#     # ------------------------------------------------------------
+#     # Step 3: remove-one-link contribution scoring on final passing set
+#     # ------------------------------------------------------------
+#     passed_links = list(cum_upgrade_decisions.keys())
+#     passed_decisions = copy.deepcopy(cum_upgrade_decisions)
+#
+#     link_rows = []
+#
+#     total_cost_all, total_summary_all, total_cost_details_all = compute_upgrade_costs(
+#         safe_links_for_upgrade=passed_links,
+#         upgrade_decisions=passed_decisions,
+#         algorithm_name=algorithm.name
+#     )
+#
+#     for link in passed_links:
+#         reduced_decisions = copy.deepcopy(passed_decisions)
+#         removed_link_decisions = reduced_decisions.pop(link, None)
+#
+#         if not removed_link_decisions:
+#             continue
+#
+#         reduced_links = list(reduced_decisions.keys())
+#
+#         reduced_forward = copy.deepcopy(current_link_status_forward)
+#         reduced_backward = copy.deepcopy(current_link_status_backward)
+#         reduced_forward, reduced_backward = reset_all_slots_empty(reduced_forward, reduced_backward)
+#
+#         if reduced_links:
+#             perform_upgrade(
+#                 reduced_links,
+#                 reduced_decisions,
+#                 reduced_forward,
+#                 reduced_backward,
+#                 C_BAND_SLOTS,
+#                 TOTAL_SLOTS,
+#                 current_time,
+#                 algorithm
+#             )
+#
+#         bp_without_link = evaluate_blocking_probability(
+#             forward_status_pc=copy.deepcopy(reduced_forward),
+#             backward_status_pc=copy.deepcopy(reduced_backward),
+#             traffic_matrix_pc=traffic_base.copy(),
+#             PATHS=PATHS,
+#             start_time_pc=current_time,
+#             seed=seed
+#         )
+#
+#         contribution = bp_without_link - baseline_bp
+#
+#         # use full link cost from cost_details if available
+#         if link in total_cost_details_all:
+#             link_cost = float(total_cost_details_all[link].get("link_total_cost", 0.0))
+#         else:
+#             link_cost = _compute_single_link_capex_workforce(
+#                 link_id=link,
+#                 link_decisions=removed_link_decisions,
+#                 algorithm_name=algorithm.name
+#             )
+#
+#         if link_cost <= 0:
+#             continue
+#
+#         efficiency = contribution / link_cost
+#
+#         link_rows.append({
+#             "link": link,
+#             "decisions": removed_link_decisions,
+#             "bp_without_link": bp_without_link,
+#             "contribution": contribution,
+#             "cost": link_cost,
+#             "efficiency": efficiency,
+#         })
+#
+#     if not link_rows:
+#         print("❌ No valid link-level contribution rows could be computed.")
+#         _append_plan_checker_log_row(
+#             current_time=current_time,
+#             status="FAIL",
+#             reason="No valid link-level contribution rows",
+#             baseline_bp=baseline_bp,
+#             threshold=blocked_connection_prob_threshold_plan_checker,
+#             selected_links=passed_links,
+#             kept_links=[]
+#         )
+#         return False, {}
+#
+#     # ------------------------------------------------------------
+#     # Step 4: sort by contribution per dollar
+#     # ------------------------------------------------------------
+#     link_rows.sort(key=lambda x: x["efficiency"], reverse=True)
+#
+#     print("✓ Ranked links by contribution per dollar:")
+#     for row in link_rows:
+#         print(
+#             f"   link {row['link']}: "
+#             f"bp_without={row['bp_without_link']:.6f}, "
+#             f"contribution={row['contribution']:.6f}, "
+#             f"cost={row['cost']:.2f}, "
+#             f"eff={row['efficiency']:.12f}"
+#         )
+#
+#     # ------------------------------------------------------------
+#     # Step 5: keep links greedily under budget/time
+#     # ------------------------------------------------------------
+#     kept_decisions = {}
+#
+#     for row in link_rows:
+#         trial_kept = copy.deepcopy(kept_decisions)
+#         trial_kept[row["link"]] = row["decisions"]
+#
+#         trial_links = list(trial_kept.keys())
+#
+#         trial_forward = copy.deepcopy(current_link_status_forward)
+#         trial_backward = copy.deepcopy(current_link_status_backward)
+#         trial_forward, trial_backward = reset_all_slots_empty(trial_forward, trial_backward)
+#
+#         perform_upgrade(
+#             trial_links,
+#             trial_kept,
+#             trial_forward,
+#             trial_backward,
+#             C_BAND_SLOTS,
+#             TOTAL_SLOTS,
+#             current_time,
+#             algorithm
+#         )
+#
+#         (
+#             opex_ok,
+#             capex_ok,
+#             total_ok,
+#             time_ok,
+#             projected_cycle_opex,
+#             total_capex_workforce,
+#             total_downtime,
+#             cost_summary,
+#             cost_details
+#         ) = _constraints_ok(
+#             cum_upgrade_decisions=trial_kept,
+#             cum_forward=trial_forward,
+#             current_time=current_time,
+#             current_link_status_forward=current_link_status_forward,
+#             algorithm_name=algorithm.name,
+#             budget_params=budget_params
+#         )
+#
+#         if opex_ok and capex_ok and total_ok and time_ok:
+#             kept_decisions = trial_kept
+#             print(f"   → Keeping link {row['link']}")
+#         else:
+#             print(f"\n   ❌ REJECTING LINK {row['link']}")
+#             print(f"      → Cost        : {row['cost']:.2f}")
+#             print(f"      → Efficiency  : {row['efficiency']:.10f}")
+#             print(f"      → OPEX OK     : {opex_ok}")
+#             print(f"      → CAPEX OK    : {capex_ok}")
+#             print(f"      → TOTAL OK    : {total_ok}")
+#             print(f"      → TIME OK     : {time_ok}")
+#
+#     if not kept_decisions:
+#         print("❌ No links remain after budget/time pruning.")
+#         _append_plan_checker_log_row(
+#             current_time=current_time,
+#             status="FAIL",
+#             reason="All links rejected by budget/time pruning",
+#             baseline_bp=baseline_bp,
+#             threshold=blocked_connection_prob_threshold_plan_checker,
+#             selected_links=passed_links,
+#             kept_links=[]
+#         )
+#         return False, {}
+#
+#     # ------------------------------------------------------------
+#     # Step 6: final performance check on kept set
+#     # ------------------------------------------------------------
+#     kept_links = list(kept_decisions.keys())
+#
+#     final_forward = copy.deepcopy(current_link_status_forward)
+#     final_backward = copy.deepcopy(current_link_status_backward)
+#     final_forward, final_backward = reset_all_slots_empty(final_forward, final_backward)
+#
+#     perform_upgrade(
+#         kept_links,
+#         kept_decisions,
+#         final_forward,
+#         final_backward,
+#         C_BAND_SLOTS,
+#         TOTAL_SLOTS,
+#         current_time,
+#         algorithm
+#     )
+#
+#     final_bp = evaluate_blocking_probability(
+#         forward_status_pc=copy.deepcopy(final_forward),
+#         backward_status_pc=copy.deepcopy(final_backward),
+#         traffic_matrix_pc=traffic_base.copy(),
+#         PATHS=PATHS,
+#         start_time_pc=current_time,
+#         seed=seed
+#     )
+#
+#     print(f"✓ Final kept-set blocking probability = {final_bp:.6f}")
+#
+#     (
+#         opex_ok,
+#         capex_ok,
+#         total_ok,
+#         time_ok,
+#         projected_cycle_opex,
+#         total_capex_workforce,
+#         total_downtime,
+#         cost_summary,
+#         cost_details
+#     ) = _constraints_ok(
+#         cum_upgrade_decisions=kept_decisions,
+#         cum_forward=final_forward,
+#         current_time=current_time,
+#         current_link_status_forward=current_link_status_forward,
+#         algorithm_name=algorithm.name,
+#         budget_params=budget_params
+#     )
+#
+#     if final_bp <= blocked_connection_prob_threshold_plan_checker:
+#         print("✅ PLAN CHECKER PASSED — final kept set satisfies performance and constraints.")
+#
+#         _append_plan_checker_log_row(
+#             current_time=current_time,
+#             status="PASS",
+#             reason="Final kept set satisfies performance and constraints",
+#             baseline_bp=final_bp,
+#             threshold=blocked_connection_prob_threshold_plan_checker,
+#             selected_links=passed_links,
+#             kept_links=kept_links,
+#             projected_cycle_opex=projected_cycle_opex,
+#             total_capex_workforce=total_capex_workforce,
+#             total_downtime=total_downtime,
+#             opex_ok=opex_ok,
+#             capex_ok=capex_ok,
+#             total_ok=total_ok,
+#             time_ok=time_ok,
+#         )
+#         return True, kept_decisions
+#
+#     print("❌ Final kept set is under budget/time but does not satisfy threshold.")
+#
+#     _append_plan_checker_log_row(
+#         current_time=current_time,
+#         status="FAIL",
+#         reason="Final kept set under budget/time but fails performance",
+#         baseline_bp=final_bp,
+#         threshold=blocked_connection_prob_threshold_plan_checker,
+#         selected_links=passed_links,
+#         kept_links=kept_links,
+#         projected_cycle_opex=projected_cycle_opex,
+#         total_capex_workforce=total_capex_workforce,
+#         total_downtime=total_downtime,
+#         opex_ok=opex_ok,
+#         capex_ok=capex_ok,
+#         total_ok=total_ok,
+#         time_ok=time_ok,
+#     )
+#     return False, kept_decisions
+
+
+
+# import copy
+# import csv
+# import random
+# from pathlib import Path
+#
+# from sim.core import topology as Topology
+# from sim.upgrade.upgrade_manager import (
+#     reset_all_slots_empty,
+#     perform_upgrade,
+#     choose_upgrade_type,
+# )
+# from sim.upgrade.cost_model import compute_upgrade_costs
+# from sim.routing.rsa import execute_first_fit
+# from sim.core.traffic_generator import NetworkTrafficGenerator
+# from sim.core.constants import *
+# from sim.upgrade.opex_model import compute_network_opex_per_day
+# from sim.core import blocked_connection_prob_threshold_plan_checker
+#
+#
+# # =====================================================================
+# # Logging helpers
+# # =====================================================================
+#
+# def _get_plan_checker_log_path() -> Path:
+#     return Path("results") / "plan_checker_log.csv"
+#
+#
+# def _init_plan_checker_log_if_needed():
+#     log_path = _get_plan_checker_log_path()
+#     if not log_path.exists():
+#         log_path.parent.mkdir(parents=True, exist_ok=True)
+#         with open(log_path, "w", newline="", encoding="utf-8") as f:
+#             writer = csv.writer(f)
+#             writer.writerow([
+#                 "time_day",
+#                 "status",
+#                 "reason",
+#                 "baseline_bp",
+#                 "threshold",
+#                 "selected_links",
+#                 "kept_links",
+#                 "projected_cycle_opex",
+#                 "total_capex_workforce",
+#                 "total_downtime",
+#                 "opex_ok",
+#                 "capex_ok",
+#                 "total_ok",
+#                 "time_ok",
+#             ])
+#
+#
+# def _append_plan_checker_log_row(
+#     current_time,
+#     status,
+#     reason,
+#     baseline_bp,
+#     threshold,
+#     selected_links,
+#     kept_links,
+#     projected_cycle_opex="",
+#     total_capex_workforce="",
+#     total_downtime="",
+#     opex_ok="",
+#     capex_ok="",
+#     total_ok="",
+#     time_ok="",
+# ):
+#     _init_plan_checker_log_if_needed()
+#     with open(_get_plan_checker_log_path(), "a", newline="", encoding="utf-8") as f:
+#         writer = csv.writer(f)
+#         writer.writerow([
+#             current_time,
+#             status,
+#             reason,
+#             baseline_bp,
+#             threshold,
+#             list(selected_links) if selected_links is not None else [],
+#             list(kept_links) if kept_links is not None else [],
+#             projected_cycle_opex,
+#             total_capex_workforce,
+#             total_downtime,
+#             opex_ok,
+#             capex_ok,
+#             total_ok,
+#             time_ok,
+#         ])
+#
+#
+# # =====================================================================
+# # Downtime / cost / budget helpers
+# # =====================================================================
+#
+# def _get_upgrade_downtime_days_local(dec, algorithm_name):
+#     """
+#     Local downtime mapping.
+#     """
+#     if dec is None:
+#         return 0.0
+#
+#     utype = dec.get("upgrade_type")
+#
+#     if utype == "new_fiber_C":
+#         return float(t_C1)
+#     if utype == "new_fiber_CL":
+#         return float(t_CL1)
+#     if utype == "band_upgrade":
+#         return float(t_b)
+#     if utype == "core_upgrade":
+#         return float(t_3C)
+#
+#     return 0.0
+#
+#
+# def _compute_cycle_budget_components(current_time, current_link_status_forward, budget_params=None):
+#     """
+#     Returns budgets for the current cycle:
+#       - OPEX budget
+#       - CAPEX + workforce budget
+#       - TOTAL budget
+#     """
+#     if budget_params is None:
+#         raise ValueError("budget_params cannot be None")
+#
+#     period_days = int(budget_params["period_days"])
+#     inflation_rate = float(budget_params["inflation_rate"])
+#
+#     period_idx = int(current_time // period_days)
+#     growth = (1.0 + inflation_rate) ** period_idx
+#
+#     current_opex_budget = float(budget_params["period_opex_budget_0"]) * growth
+#     current_capex_budget = float(budget_params["period_capex_budget_0"]) * growth
+#     current_total_budget = float(budget_params["period_total_budget_0"]) * growth
+#
+#     return current_opex_budget, current_capex_budget, current_total_budget
+#
+#
+# def _compute_total_downtime(cum_upgrade_decisions, algorithm_name):
+#     """
+#     Rule per link:
+#       - one decision  -> use that decision time
+#       - multiple decisions -> use max(decision times)
+#
+#     Total downtime = sum across links
+#     """
+#     total_downtime = 0.0
+#
+#     for _, decs in cum_upgrade_decisions.items():
+#         if decs is None:
+#             continue
+#
+#         if isinstance(decs, dict):
+#             decs = [decs]
+#
+#         valid_decs = [d for d in decs if d is not None and d.get("upgrade_type") is not None]
+#         if not valid_decs:
+#             continue
+#
+#         link_times = [
+#             _get_upgrade_downtime_days_local(dec, algorithm_name)
+#             for dec in valid_decs
+#         ]
+#
+#         if len(link_times) == 1:
+#             link_downtime = link_times[0]
+#         else:
+#             link_downtime = max(link_times)
+#
+#         total_downtime += link_downtime
+#
+#     return total_downtime
+#
+#
+# def _compute_total_capex_workforce(cum_upgrade_decisions, algorithm_name):
+#     """
+#     Compute total equipment + workforce cost for the cumulative selected set.
+#     compute_upgrade_costs expects each link's decisions to be a list.
+#     """
+#     normalized = {}
+#
+#     for link_id, decs in cum_upgrade_decisions.items():
+#         if decs is None:
+#             continue
+#
+#         if isinstance(decs, dict):
+#             normalized[link_id] = [decs]
+#         elif isinstance(decs, list):
+#             valid = [d for d in decs if d is not None and d.get("upgrade_type") is not None]
+#             if valid:
+#                 normalized[link_id] = valid
+#         else:
+#             raise ValueError(f"Unexpected decision format for link {link_id}: {type(decs)}")
+#
+#     safe_links_for_upgrade = list(normalized.keys())
+#
+#     if not safe_links_for_upgrade:
+#         return 0.0, {"equipment_total": 0.0, "workforce_total": 0.0}, {}
+#
+#     total_cost, cost_summary, cost_details = compute_upgrade_costs(
+#         safe_links_for_upgrade=safe_links_for_upgrade,
+#         upgrade_decisions=normalized,
+#         algorithm_name=algorithm_name
+#     )
+#
+#     total_capex_workforce = (
+#         float(cost_summary.get("equipment_total", 0.0))
+#         + float(cost_summary.get("workforce_total", 0.0))
+#     )
+#
+#     return total_capex_workforce, cost_summary, cost_details
+#
+#
+# def _compute_projected_cycle_opex(cum_forward):
+#     """
+#     Compute projected OPEX for one upgrade-initiation cycle under the
+#     currently selected upgraded state.
+#     """
+#     daily_opex = float(compute_network_opex_per_day(cum_forward))
+#     period_opex = daily_opex * float(Upgrade_initiation_days)
+#     return daily_opex, period_opex
+#
+#
+# def _constraints_ok(
+#     cum_upgrade_decisions,
+#     cum_forward,
+#     current_time,
+#     current_link_status_forward,
+#     algorithm_name,
+#     budget_params=None,
+#    budget_selection_mode="budget_aware"
+# ):
+#     """
+#     Check all constraints:
+#       - OPEX budget
+#       - CAPEX + workforce budget
+#       - TOTAL budget
+#       - Total downtime
+#     """
+#     total_capex_workforce, cost_summary, cost_details = _compute_total_capex_workforce(
+#         cum_upgrade_decisions,
+#         algorithm_name
+#     )
+#
+#     total_downtime = _compute_total_downtime(cum_upgrade_decisions, algorithm_name)
+#
+#     daily_opex, projected_cycle_opex = _compute_projected_cycle_opex(cum_forward)
+#
+#     current_opex_budget, current_capex_budget, current_total_budget = _compute_cycle_budget_components(
+#         current_time,
+#         current_link_status_forward,
+#         budget_params
+#     )
+#
+#     total_projected_spending = projected_cycle_opex + total_capex_workforce
+#
+#     time_ok = total_downtime <= Upgrade_initiation_days
+#
+#     if budget_selection_mode == "budget_aware":
+#         opex_ok = projected_cycle_opex <= current_opex_budget
+#         capex_ok = total_capex_workforce <= current_capex_budget
+#         total_ok = total_projected_spending <= current_total_budget
+#
+#     elif budget_selection_mode == "budget_unaware":
+#         opex_ok = True
+#         capex_ok = True
+#         total_ok = True
+#
+#     print(f"   → Daily OPEX under current upgraded state: {daily_opex:.2f}")
+#     print(f"   → Projected OPEX for this {Upgrade_initiation_days}-day cycle: {projected_cycle_opex:.2f}")
+#     print(f"   → OPEX budget for cycle: {current_opex_budget:.2f}")
+#     print(f"   → CAPEX + Workforce spent: {total_capex_workforce:.2f}")
+#     print(f"   → CAPEX + Workforce budget for cycle: {current_capex_budget:.2f}")
+#     print(f"   → Total projected spending this cycle: {total_projected_spending:.2f}")
+#     print(f"   → Total budget for cycle: {current_total_budget:.2f}")
+#     print(f"   → Total downtime: {total_downtime:.2f} days")
+#     print(f"   → OPEX constraint: {'PASS' if opex_ok else 'FAIL'}")
+#     print(f"   → CAPEX/WF constraint: {'PASS' if capex_ok else 'FAIL'}")
+#     print(f"   → TOTAL budget constraint: {'PASS' if total_ok else 'FAIL'}")
+#     print(f"   → Time constraint: {'PASS' if time_ok else 'FAIL'}")
+#
+#     return (
+#         opex_ok,
+#         capex_ok,
+#         total_ok,
+#         time_ok,
+#         projected_cycle_opex,
+#         total_capex_workforce,
+#         total_downtime,
+#         cost_summary,
+#         cost_details
+#     )
+#
+#
+# def _canonicalize_link_decisions(dec_list):
+#     """
+#     Clean one link's ordered decision list.
+#
+#     Rules:
+#       1) remove invalid decisions
+#       2) merge:
+#             new_fiber_C(f) + band_upgrade(f) -> new_fiber_CL(f)
+#          on the same fiber
+#       3) if a core_upgrade exists, drop everything before the first core_upgrade
+#          and keep only from core_upgrade onward
+#     """
+#     if not dec_list:
+#         return []
+#
+#     cleaned = [d for d in dec_list if d is not None and d.get("upgrade_type") is not None]
+#     if not cleaned:
+#         return []
+#
+#     # If core_upgrade exists, everything before it becomes irrelevant
+#     core_idx = None
+#     for idx, d in enumerate(cleaned):
+#         if d.get("upgrade_type") == "core_upgrade":
+#             core_idx = idx
+#             break
+#
+#     if core_idx is not None:
+#         cleaned = cleaned[core_idx:]
+#
+#     # Merge new_fiber_C + band_upgrade on same fiber into new_fiber_CL
+#     merged = []
+#     i = 0
+#     while i < len(cleaned):
+#         d1 = cleaned[i]
+#
+#         if i + 1 < len(cleaned):
+#             d2 = cleaned[i + 1]
+#
+#             if (
+#                 d1.get("upgrade_type") == "new_fiber_C"
+#                 and d2.get("upgrade_type") == "band_upgrade"
+#                 and d1.get("fiber_id") == d2.get("fiber_id")
+#             ):
+#                 merged.append({
+#                     "upgrade_type": "new_fiber_CL",
+#                     "fiber_id": d1.get("fiber_id"),
+#                     "core_type": d1.get("core_type"),
+#                 })
+#                 i += 2
+#                 continue
+#
+#         merged.append(d1)
+#         i += 1
+#
+#     return merged
+#
+#
+# def _normalize_upgrade_decisions(upgrade_decisions):
+#     """
+#     Normalize and canonicalize per-link decision lists.
+#     """
+#     normalized = {}
+#
+#     for link, decs in upgrade_decisions.items():
+#         if decs is None:
+#             continue
+#
+#         if isinstance(decs, dict):
+#             decs = [decs]
+#
+#         canonical = _canonicalize_link_decisions(list(decs))
+#
+#         if canonical:
+#             normalized[link] = canonical
+#
+#     return normalized
+#
+#
+# def _compute_single_link_capex_workforce(link_id, link_decisions, algorithm_name):
+#     """
+#     Compute equipment + workforce for one link's already-decided upgrade list.
+#     """
+#     total_cost, cost_summary, cost_details = compute_upgrade_costs(
+#         safe_links_for_upgrade=[link_id],
+#         upgrade_decisions={link_id: link_decisions},
+#         algorithm_name=algorithm_name
+#     )
+#
+#     return (
+#         float(cost_summary.get("equipment_total", 0.0))
+#         + float(cost_summary.get("workforce_total", 0.0))
+#     )
+#
+# def _get_link_heaviest_upgrade_level(decs):
+#     """
+#     Classify a link by the heaviest upgrade present in its decision list.
+#     Lower value = lighter technology, preferred in fallback.
+#       band_upgrade -> 1
+#       new_fiber_C  -> 2
+#       new_fiber_CL -> 3
+#       core_upgrade -> 4
+#     """
+#     if not decs:
+#         return 999
+#
+#     if isinstance(decs, dict):
+#         decs = [decs]
+#
+#     utypes = [d.get("upgrade_type") for d in decs if d is not None and d.get("upgrade_type") is not None]
+#
+#     if "core_upgrade" in utypes:
+#         return 4
+#     if "band_upgrade" in utypes:
+#         return 3
+#     if "new_fiber_CL" in utypes:
+#         return 2
+#     if "new_fiber_C" in utypes:
+#         return 1
+#
+#     return 999
+#
+#
+# def _get_link_max_downtime(decs, algorithm_name):
+#     """
+#     For one link, return the max downtime among its decisions.
+#     Used only for fallback ranking.
+#     """
+#     if not decs:
+#         return float("inf")
+#
+#     if isinstance(decs, dict):
+#         decs = [decs]
+#
+#     vals = [
+#         _get_upgrade_downtime_days_local(d, algorithm_name)
+#         for d in decs
+#         if d is not None and d.get("upgrade_type") is not None
+#     ]
+#
+#     return max(vals) if vals else float("inf")
+#
+#
+# def _run_fallback_light_links_first(
+#     link_rows,
+#     current_time,
+#     current_link_status_forward,
+#     current_link_status_backward,
+#     PATHS,
+#     traffic_base,
+#     seed,
+#     algorithm,
+#     budget_params,
+# ):
+#     """
+#     Fallback strategy:
+#       - do NOT change per-link decisions
+#       - prefer links with lighter upgrade types
+#       - among same type, prefer lower downtime, then lower cost
+#       - greedily keep maximum number of feasible links
+#       - run final performance check
+#     """
+#     fallback_rows = sorted(
+#         link_rows,
+#         key=lambda x: (
+#             _get_link_heaviest_upgrade_level(x["decisions"]),
+#             _get_link_max_downtime(x["decisions"], algorithm.name),
+#             x["cost"],
+#         )
+#     )
+#
+#     print("\n" + "=" * 80)
+#     print("↺ FALLBACK MODE: TRYING LIGHTER-UPGRADE LINKS FIRST")
+#     print("=" * 80)
+#     for row in fallback_rows:
+#         print(
+#             f"   link {row['link']}: "
+#             f"heaviest={_get_link_heaviest_upgrade_level(row['decisions'])}, "
+#             f"max_dt={_get_link_max_downtime(row['decisions'], algorithm.name):.2f}, "
+#             f"cost={row['cost']:.2f}"
+#         )
+#     print("=" * 80 + "\n")
+#
+#     fallback_kept = {}
+#
+#     for row in fallback_rows:
+#         trial_kept = copy.deepcopy(fallback_kept)
+#         trial_kept[row["link"]] = row["decisions"]
+#
+#         trial_links = list(trial_kept.keys())
+#
+#         trial_forward = copy.deepcopy(current_link_status_forward)
+#         trial_backward = copy.deepcopy(current_link_status_backward)
+#         trial_forward, trial_backward = reset_all_slots_empty(trial_forward, trial_backward)
+#
+#         perform_upgrade(
+#             trial_links,
+#             trial_kept,
+#             trial_forward,
+#             trial_backward,
+#             C_BAND_SLOTS,
+#             TOTAL_SLOTS,
+#             current_time,
+#             algorithm
+#         )
+#
+#         (
+#             opex_ok,
+#             capex_ok,
+#             total_ok,
+#             time_ok,
+#             projected_cycle_opex,
+#             total_capex_workforce,
+#             total_downtime,
+#             cost_summary,
+#             cost_details
+#         ) = _constraints_ok(
+#             cum_upgrade_decisions=trial_kept,
+#             cum_forward=trial_forward,
+#             current_time=current_time,
+#             current_link_status_forward=current_link_status_forward,
+#             algorithm_name=algorithm.name,
+#             budget_params=budget_params,
+#             budget_selection_mode=budget_selection_mode
+#         )
+#
+#         if opex_ok and capex_ok and total_ok and time_ok:
+#             fallback_kept = trial_kept
+#             print(f"   → FALLBACK KEEP link {row['link']}")
+#         else:
+#             print(f"   → FALLBACK REJECT link {row['link']}")
+#
+#     if not fallback_kept:
+#         print("❌ FALLBACK: no links remain after budget/time pruning.")
+#         return False, [], {}, None, None, None, None, None, None, None
+#
+#     fallback_links = list(fallback_kept.keys())
+#
+#     final_forward = copy.deepcopy(current_link_status_forward)
+#     final_backward = copy.deepcopy(current_link_status_backward)
+#     final_forward, final_backward = reset_all_slots_empty(final_forward, final_backward)
+#
+#     perform_upgrade(
+#         fallback_links,
+#         fallback_kept,
+#         final_forward,
+#         final_backward,
+#         C_BAND_SLOTS,
+#         TOTAL_SLOTS,
+#         current_time,
+#         algorithm
+#     )
+#
+#     final_bp = evaluate_blocking_probability(
+#         forward_status_pc=copy.deepcopy(final_forward),
+#         backward_status_pc=copy.deepcopy(final_backward),
+#         traffic_matrix_pc=traffic_base.copy(),
+#         PATHS=PATHS,
+#         start_time_pc=current_time,
+#         seed=seed
+#     )
+#
+#     print(f"✓ FALLBACK final blocking probability = {final_bp:.6f}")
+#
+#     (
+#         opex_ok,
+#         capex_ok,
+#         total_ok,
+#         time_ok,
+#         projected_cycle_opex,
+#         total_capex_workforce,
+#         total_downtime,
+#         cost_summary,
+#         cost_details
+#     ) = _constraints_ok(
+#         cum_upgrade_decisions=fallback_kept,
+#         cum_forward=final_forward,
+#         current_time=current_time,
+#         current_link_status_forward=current_link_status_forward,
+#         algorithm_name=algorithm.name,
+#         budget_params=budget_params,
+#         budget_selection_mode = budget_selection_mode
+#     )
+#
+#     return (
+#         final_bp <= blocked_connection_prob_threshold_plan_checker,
+#         fallback_links,
+#         fallback_kept,
+#         final_bp,
+#         projected_cycle_opex,
+#         total_capex_workforce,
+#         total_downtime,
+#         opex_ok,
+#         capex_ok,
+#         total_ok,
+#         time_ok,
+#     )
+#
+#
+# # =====================================================================
+# # Blocking simulation
+# # =====================================================================
+#
+# def run_planchecker_simulation(
+#     forward_status_pc,
+#     backward_status_pc,
+#     traffic_matrix_pc,
+#     PATHS,
+#     start_time_pc,
+#     seed
+# ):
+#     """
+#     Boolean pass/fail wrapper retained for compatibility.
+#     """
+#     bp = evaluate_blocking_probability(
+#         forward_status_pc=forward_status_pc,
+#         backward_status_pc=backward_status_pc,
+#         traffic_matrix_pc=traffic_matrix_pc,
+#         PATHS=PATHS,
+#         start_time_pc=start_time_pc,
+#         seed=seed
+#     )
+#     return bp <= blocked_connection_prob_threshold_plan_checker
+#
+#
+# def evaluate_blocking_probability(
+#     forward_status_pc,
+#     backward_status_pc,
+#     traffic_matrix_pc,
+#     PATHS,
+#     start_time_pc,
+#     seed
+# ):
+#     """
+#     Runs a projection-window traffic simulation and returns blocking probability.
+#     """
+#     testing_topology = Topology.TOPOLOGY
+#
+#     start_pc = start_time_pc + Upgrade_initiation_days
+#     current_time_pc = start_pc
+#     SIM_END_pc = start_pc + Traffic_growth_days
+#
+#     pc_rng = random.Random(seed + 5555)
+#
+#     tg_pc = NetworkTrafficGenerator(
+#         number_of_nodes=Topology.N,
+#         datarates=DATARATE,
+#         lambda_0=lambda_0,
+#         mean_holding_time=MEAN_HOLDING_TIME,
+#         Current_global_time=start_pc,
+#         rng=pc_rng
+#     )
+#
+#     ALL_DEMANDS_PLAN_CHECKER = []
+#     blocked_pc = 0
+#     total_pc = 0
+#     next_growth_time_pc = start_pc + Traffic_growth_days
+#
+#     while True:
+#         while current_time_pc >= next_growth_time_pc:
+#             for i in range(Topology.N):
+#                 for j in range(Topology.N):
+#                     if i != j:
+#                         growth = 1 + pc_rng.uniform(0, alpha / 100)
+#                         traffic_matrix_pc[i][j] *= growth
+#                         traffic_matrix_pc[i][j] *= (1 + delta / 100)
+#             next_growth_time_pc += Traffic_growth_days
+#
+#         src_pc, dest_pc, rate_pc = tg_pc.generate_connection_data()
+#         lam = traffic_matrix_pc[src_pc][dest_pc]
+#         arrival_time_pc, holding_time_pc = tg_pc.get_connection(lam)
+#         current_time_pc = arrival_time_pc
+#
+#         if current_time_pc >= SIM_END_pc:
+#             break
+#
+#         departure_time_pc = arrival_time_pc + holding_time_pc
+#         total_pc += 1
+#
+#         index_to_remove_plan_checker = []
+#
+#         for idp, conn_pc in enumerate(ALL_DEMANDS_PLAN_CHECKER):
+#             if conn_pc.departure_time_pc <= current_time_pc:
+#                 index_to_remove_plan_checker.append(idp)
+#
+#         for idp in reversed(index_to_remove_plan_checker):
+#             conn_pc = ALL_DEMANDS_PLAN_CHECKER[idp]
+#
+#             for i in range(len(conn_pc.path_pc) - 1):
+#                 src_depart = conn_pc.path_pc[i]
+#                 dest_depart = conn_pc.path_pc[i + 1]
+#
+#                 link_pc = conn_pc.link_ids_pc[i]
+#                 fiber_pc = conn_pc.fibers_used_pc[i]
+#                 core_pc = conn_pc.cores_used_pc[i]
+#
+#                 if src_depart < dest_depart:
+#                     if link_pc in forward_status_pc and fiber_pc in forward_status_pc[link_pc]:
+#                         fwd_obj = forward_status_pc[link_pc][fiber_pc]
+#
+#                         if isinstance(fwd_obj, dict) and "slots" in fwd_obj:
+#                             for s in range(conn_pc.fs_pc, conn_pc.fs_pc + conn_pc.sw_pc):
+#                                 fwd_obj["slots"][s] = 0
+#                         else:
+#                             if core_pc in fwd_obj:
+#                                 for s in range(conn_pc.fs_pc, conn_pc.fs_pc + conn_pc.sw_pc):
+#                                     fwd_obj[core_pc]["slots"][s] = 0
+#                 else:
+#                     if link_pc in backward_status_pc and fiber_pc in backward_status_pc[link_pc]:
+#                         bwd_obj = backward_status_pc[link_pc][fiber_pc]
+#
+#                         if isinstance(bwd_obj, dict) and "slots" in bwd_obj:
+#                             for s in range(conn_pc.fs_pc, conn_pc.fs_pc + conn_pc.sw_pc):
+#                                 bwd_obj["slots"][s] = 0
+#                         else:
+#                             if core_pc in bwd_obj:
+#                                 for s in range(conn_pc.fs_pc, conn_pc.fs_pc + conn_pc.sw_pc):
+#                                     bwd_obj[core_pc]["slots"][s] = 0
+#
+#             del ALL_DEMANDS_PLAN_CHECKER[idp]
+#
+#         mf_pc, fs_pc, sw_pc, path_pc, fibers_used_pc, cores_used_pc, link_ids_pc, attempted_paths_info_pc = execute_first_fit(
+#             src=src_pc,
+#             dest=dest_pc,
+#             datarate=rate_pc,
+#             arrival_time=arrival_time_pc,
+#             departure_time=departure_time_pc,
+#             link_status_forward=forward_status_pc,
+#             link_status_backward=backward_status_pc,
+#             topology=testing_topology,
+#             PATHS=PATHS
+#         )
+#
+#         if mf_pc == float("inf") or fs_pc == float("inf"):
+#             blocked_pc += 1
+#         else:
+#             ALL_DEMANDS_PLAN_CHECKER.append(
+#                 ConnectionData_plan_checker(
+#                     path_pc, link_ids_pc, fs_pc, sw_pc, mf_pc,
+#                     arrival_time_pc, holding_time_pc, departure_time_pc,
+#                     rate_pc, fibers_used_pc, cores_used_pc
+#                 )
+#             )
+#
+#     blocking_probability_pc = (blocked_pc / total_pc) if total_pc > 0 else 1.0
+#
+#     print(f"   → Total requests tested: {total_pc}")
+#     print(f"   → Blocked connections: {blocked_pc}")
+#     print(f"   → Blocking probability: {blocking_probability_pc:.4f}")
+#
+#     return blocking_probability_pc
+#
+#
+# def plan_checker(
+#         safe_links,
+#         upgrade_decisions,
+#         current_time,
+#         PATHS,
+#         current_traffic,
+#         current_link_status_forward,
+#         current_link_status_backward,
+#         seed,
+#         algorithm,
+#         budget_params=None,
+#         budget_selection_mode="budget_aware",
+# ):
+#     print("\n▶ RUNNING PLAN CHECKER...")
+#
+#     # ------------------------------------------------------------
+#     # Step 0: normalize decisions from main.py
+#     # ------------------------------------------------------------
+#     full_decisions = _normalize_upgrade_decisions(upgrade_decisions)
+#
+#     print(f"PLAN CHECKER MODE: {budget_selection_mode}")
+#
+#     if not full_decisions:
+#         print("❌ No valid upgrade decisions received.")
+#         _append_plan_checker_log_row(
+#             current_time=current_time,
+#             status="FAIL",
+#             reason="No valid upgrade decisions received",
+#             baseline_bp="",
+#             threshold=blocked_connection_prob_threshold_plan_checker,
+#             selected_links=[],
+#             kept_links=[]
+#         )
+#         return False, [], {}
+#
+#     # Keep input ordering from main.py
+#     full_links = [lid for lid in safe_links if lid in full_decisions]
+#     if not full_links:
+#         full_links = list(full_decisions.keys())
+#
+#     # ------------------------------------------------------------
+#     # Step 1: create cumulative state from initial decisions
+#     # ------------------------------------------------------------
+#     cum_forward = copy.deepcopy(current_link_status_forward)
+#     cum_backward = copy.deepcopy(current_link_status_backward)
+#     cum_forward, cum_backward = reset_all_slots_empty(cum_forward, cum_backward)
+#
+#     perform_upgrade(
+#         full_links,
+#         full_decisions,
+#         cum_forward,
+#         cum_backward,
+#         C_BAND_SLOTS,
+#         TOTAL_SLOTS,
+#         current_time,
+#         algorithm
+#     )
+#     print("✓ Applied full candidate upgrade set from main.py")
+#
+#     traffic_base = current_traffic.copy()
+#     steps = int(Upgrade_initiation_days / Traffic_growth_days)
+#     growth_factor_pc = ((1 + alpha / 100) * (1 + delta / 100)) ** steps
+#     traffic_base *= growth_factor_pc
+#
+#     print(f"✓ Traffic projected +{Upgrade_initiation_days} days ahead")
+#
+#     # cumulative decisions that may grow in progressive rounds
+#     cum_upgrade_decisions = copy.deepcopy(full_decisions)
+#
+#     # ------------------------------------------------------------
+#     # Step 2: progressive multi-round escalation if performance fails
+#     # ------------------------------------------------------------
+#     round_idx = 0
+#
+#     while True:
+#         baseline_bp = evaluate_blocking_probability(
+#             forward_status_pc=copy.deepcopy(cum_forward),
+#             backward_status_pc=copy.deepcopy(cum_backward),
+#             traffic_matrix_pc=traffic_base.copy(),
+#             PATHS=PATHS,
+#             start_time_pc=current_time,
+#             seed=seed
+#         )
+#
+#         print(f"✓ Current cumulative blocking probability = {baseline_bp:.6f}")
+#
+#         if baseline_bp <= blocked_connection_prob_threshold_plan_checker:
+#             print("\n" + "-" * 80)
+#             print("✓ PLAN CHECKER: PERFORMANCE PASSES")
+#             print("-" * 80)
+#             print(f"→ Current day        : {current_time}")
+#             print(f"→ Blocking           : {baseline_bp:.6f}")
+#             print(f"→ Threshold          : {blocked_connection_prob_threshold_plan_checker:.6f}")
+#             print(f"→ Candidate links    : {list(cum_upgrade_decisions.keys())}")
+#             print("-" * 80 + "\n")
+#             break
+#
+#         round_idx += 1
+#         print("\n" + "=" * 80)
+#         print(f"❌ PLAN CHECKER PERFORMANCE FAILED — STARTING ROUND #{round_idx} ESCALATION")
+#         print("=" * 80)
+#         print(f"→ Current simulation day           : {current_time}")
+#         print(f"→ Blocking threshold               : {blocked_connection_prob_threshold_plan_checker:.6f}")
+#         print(f"→ Achieved blocking                : {baseline_bp:.6f}")
+#         print("→ Escalating next upgrade decision for all eligible links")
+#         print("=" * 80 + "\n")
+#
+#         round_upgrades = {}
+#
+#         for link in full_links:
+#             upg = choose_upgrade_type(
+#                 link,
+#                 cum_forward,
+#                 cum_backward,
+#                 algorithm
+#             )
+#
+#             if upg is None or upg.get("upgrade_type") is None:
+#                 continue
+#
+#             round_upgrades[link] = upg
+#
+#         if not round_upgrades:
+#             print("⚠️ No further upgrades possible on any selected link.")
+#             _append_plan_checker_log_row(
+#                 current_time=current_time,
+#                 status="FAIL",
+#                 reason="Performance failed and no further upgrades possible",
+#                 baseline_bp=baseline_bp,
+#                 threshold=blocked_connection_prob_threshold_plan_checker,
+#                 selected_links=list(cum_upgrade_decisions.keys()),
+#                 kept_links=[]
+#             )
+#             return False, list(cum_upgrade_decisions.keys()), cum_upgrade_decisions
+#
+#         print(f"✓ Selected next upgrades for {len(round_upgrades)} links in escalation round #{round_idx}")
+#
+#         # Append then canonicalize immediately
+#         for link, upg in round_upgrades.items():
+#             if link not in cum_upgrade_decisions:
+#                 cum_upgrade_decisions[link] = []
+#             elif isinstance(cum_upgrade_decisions[link], dict):
+#                 cum_upgrade_decisions[link] = [cum_upgrade_decisions[link]]
+#             elif cum_upgrade_decisions[link] is None:
+#                 cum_upgrade_decisions[link] = []
+#
+#             cum_upgrade_decisions[link].append(upg)
+#             cum_upgrade_decisions[link] = _canonicalize_link_decisions(cum_upgrade_decisions[link])
+#
+#         # rebuild cumulative network state cleanly from scratch
+#         cum_upgrade_decisions = _normalize_upgrade_decisions(cum_upgrade_decisions)
+#
+#         cum_forward = copy.deepcopy(current_link_status_forward)
+#         cum_backward = copy.deepcopy(current_link_status_backward)
+#         cum_forward, cum_backward = reset_all_slots_empty(cum_forward, cum_backward)
+#
+#         perform_upgrade(
+#             list(cum_upgrade_decisions.keys()),
+#             cum_upgrade_decisions,
+#             cum_forward,
+#             cum_backward,
+#             C_BAND_SLOTS,
+#             TOTAL_SLOTS,
+#             current_time,
+#             algorithm
+#         )
+#
+#     # ------------------------------------------------------------
+#     # Step 3: canonicalize once more before contribution scoring
+#     # ------------------------------------------------------------
+#     cum_upgrade_decisions = _normalize_upgrade_decisions(cum_upgrade_decisions)
+#
+#     passed_links = list(cum_upgrade_decisions.keys())
+#     passed_decisions = copy.deepcopy(cum_upgrade_decisions)
+#
+#     link_rows = []
+#
+#     total_cost_all, total_summary_all, total_cost_details_all = compute_upgrade_costs(
+#         safe_links_for_upgrade=passed_links,
+#         upgrade_decisions=passed_decisions,
+#         algorithm_name=algorithm.name
+#     )
+#
+#     for link in passed_links:
+#         reduced_decisions = copy.deepcopy(passed_decisions)
+#         removed_link_decisions = reduced_decisions.pop(link, None)
+#
+#         if not removed_link_decisions:
+#             continue
+#
+#         reduced_links = list(reduced_decisions.keys())
+#
+#         reduced_forward = copy.deepcopy(current_link_status_forward)
+#         reduced_backward = copy.deepcopy(current_link_status_backward)
+#         reduced_forward, reduced_backward = reset_all_slots_empty(reduced_forward, reduced_backward)
+#
+#         if reduced_links:
+#             perform_upgrade(
+#                 reduced_links,
+#                 reduced_decisions,
+#                 reduced_forward,
+#                 reduced_backward,
+#                 C_BAND_SLOTS,
+#                 TOTAL_SLOTS,
+#                 current_time,
+#                 algorithm
+#             )
+#
+#         bp_without_link = evaluate_blocking_probability(
+#             forward_status_pc=copy.deepcopy(reduced_forward),
+#             backward_status_pc=copy.deepcopy(reduced_backward),
+#             traffic_matrix_pc=traffic_base.copy(),
+#             PATHS=PATHS,
+#             start_time_pc=current_time,
+#             seed=seed
+#         )
+#
+#         contribution = bp_without_link - baseline_bp
+#
+#         if link in total_cost_details_all:
+#             link_cost = float(total_cost_details_all[link].get("link_total_cost", 0.0))
+#         else:
+#             link_cost = _compute_single_link_capex_workforce(
+#                 link_id=link,
+#                 link_decisions=removed_link_decisions,
+#                 algorithm_name=algorithm.name
+#             )
+#
+#         if link_cost <= 0:
+#             continue
+#
+#         efficiency = contribution / link_cost
+#
+#         link_rows.append({
+#             "link": link,
+#             "decisions": removed_link_decisions,
+#             "bp_without_link": bp_without_link,
+#             "contribution": contribution,
+#             "cost": link_cost,
+#             "efficiency": efficiency,
+#         })
+#
+#     if not link_rows:
+#         print("❌ No valid link-level contribution rows could be computed.")
+#         _append_plan_checker_log_row(
+#             current_time=current_time,
+#             status="FAIL",
+#             reason="No valid link-level contribution rows",
+#             baseline_bp=baseline_bp,
+#             threshold=blocked_connection_prob_threshold_plan_checker,
+#             selected_links=passed_links,
+#             kept_links=[]
+#         )
+#         return False, [], {}
+#
+#     # ------------------------------------------------------------
+#     # Step 4: sort by contribution per dollar
+#     # ------------------------------------------------------------
+#     if budget_selection_mode == "budget_aware":
+#         link_rows.sort(key=lambda x: x["efficiency"], reverse=True)
+#
+#     elif budget_selection_mode == "budget_unaware":
+#         link_rows.sort(key=lambda x: x["contribution"], reverse=True)
+#
+#     else:
+#         raise ValueError(f"Unknown mode: {budget_selection_mode}")
+#
+#     print("✓ Ranked links by contribution per dollar:")
+#     for row in link_rows:
+#         print(
+#             f"   link {row['link']}: "
+#             f"bp_without={row['bp_without_link']:.6f}, "
+#             f"contribution={row['contribution']:.6f}, "
+#             f"cost={row['cost']:.2f}, "
+#             f"eff={row['efficiency']:.12f}"
+#         )
+#
+#     # ------------------------------------------------------------
+#     # Step 5: keep links greedily under budget/time
+#     # ------------------------------------------------------------
+#     kept_decisions = {}
+#
+#     for row in link_rows:
+#         trial_kept = copy.deepcopy(kept_decisions)
+#         trial_kept[row["link"]] = row["decisions"]
+#
+#         trial_links = list(trial_kept.keys())
+#
+#         trial_forward = copy.deepcopy(current_link_status_forward)
+#         trial_backward = copy.deepcopy(current_link_status_backward)
+#         trial_forward, trial_backward = reset_all_slots_empty(trial_forward, trial_backward)
+#
+#         perform_upgrade(
+#             trial_links,
+#             trial_kept,
+#             trial_forward,
+#             trial_backward,
+#             C_BAND_SLOTS,
+#             TOTAL_SLOTS,
+#             current_time,
+#             algorithm
+#         )
+#
+#         (
+#             opex_ok,
+#             capex_ok,
+#             total_ok,
+#             time_ok,
+#             projected_cycle_opex,
+#             total_capex_workforce,
+#             total_downtime,
+#             cost_summary,
+#             cost_details
+#         ) = _constraints_ok(
+#             cum_upgrade_decisions=trial_kept,
+#             cum_forward=trial_forward,
+#             current_time=current_time,
+#             current_link_status_forward=current_link_status_forward,
+#             algorithm_name=algorithm.name,
+#             budget_params=budget_params,
+#             budget_selection_mode=budget_selection_mode
+#
+#         )
+#
+#         if budget_selection_mode == "budget_aware":
+#             keep_link = opex_ok and capex_ok and total_ok and time_ok
+#
+#         elif budget_selection_mode == "budget_unaware":
+#             keep_link = time_ok
+#
+#         else:
+#             raise ValueError(f"Unknown mode: {budget_selection_mode}")
+#
+#         if keep_link:
+#             kept_decisions = trial_kept
+#             print(f"   → Keeping link {row['link']}")
+#         else:
+#             print(f"\n   ❌ REJECTING LINK {row['link']}")
+#             print(f"      → Cost        : {row['cost']:.2f}")
+#             print(f"      → Efficiency  : {row['efficiency']:.10f}")
+#             print(f"      → OPEX OK     : {opex_ok}")
+#             print(f"      → CAPEX OK    : {capex_ok}")
+#             print(f"      → TOTAL OK    : {total_ok}")
+#             print(f"      → TIME OK     : {time_ok}")
+#
+#     if not kept_decisions:
+#         print("❌ No links remain after budget/time pruning.")
+#         _append_plan_checker_log_row(
+#             current_time=current_time,
+#             status="FAIL",
+#             reason="All links rejected by budget/time pruning",
+#             baseline_bp=baseline_bp,
+#             threshold=blocked_connection_prob_threshold_plan_checker,
+#             selected_links=passed_links,
+#             kept_links=[]
+#         )
+#         return False, [], {}
+#
+#     # ------------------------------------------------------------
+#     # Step 6: final performance check on kept set
+#     # ------------------------------------------------------------
+#     kept_links = list(kept_decisions.keys())
+#
+#     final_forward = copy.deepcopy(current_link_status_forward)
+#     final_backward = copy.deepcopy(current_link_status_backward)
+#     final_forward, final_backward = reset_all_slots_empty(final_forward, final_backward)
+#
+#     perform_upgrade(
+#         kept_links,
+#         kept_decisions,
+#         final_forward,
+#         final_backward,
+#         C_BAND_SLOTS,
+#         TOTAL_SLOTS,
+#         current_time,
+#         algorithm
+#     )
+#
+#     final_bp = evaluate_blocking_probability(
+#         forward_status_pc=copy.deepcopy(final_forward),
+#         backward_status_pc=copy.deepcopy(final_backward),
+#         traffic_matrix_pc=traffic_base.copy(),
+#         PATHS=PATHS,
+#         start_time_pc=current_time,
+#         seed=seed
+#     )
+#
+#     print(f"✓ Final kept-set blocking probability = {final_bp:.6f}")
+#
+#     (
+#         opex_ok,
+#         capex_ok,
+#         total_ok,
+#         time_ok,
+#         projected_cycle_opex,
+#         total_capex_workforce,
+#         total_downtime,
+#         cost_summary,
+#         cost_details
+#     ) = _constraints_ok(
+#         cum_upgrade_decisions=kept_decisions,
+#         cum_forward=final_forward,
+#         current_time=current_time,
+#         current_link_status_forward=current_link_status_forward,
+#         algorithm_name=algorithm.name,
+#         budget_params=budget_params,
+#         budget_selection_mode=budget_selection_mode
+#     )
+#
+#     if final_bp <= blocked_connection_prob_threshold_plan_checker:
+#         print("✅ PLAN CHECKER PASSED — final kept set satisfies performance and constraints.")
+#
+#         _append_plan_checker_log_row(
+#             current_time=current_time,
+#             status="PASS",
+#             reason="Final kept set satisfies performance and constraints",
+#             baseline_bp=final_bp,
+#             threshold=blocked_connection_prob_threshold_plan_checker,
+#             selected_links=passed_links,
+#             kept_links=kept_links,
+#             projected_cycle_opex=projected_cycle_opex,
+#             total_capex_workforce=total_capex_workforce,
+#             total_downtime=total_downtime,
+#             opex_ok=opex_ok,
+#             capex_ok=capex_ok,
+#             total_ok=total_ok,
+#             time_ok=time_ok,
+#         )
+#         return True, list(kept_decisions.keys()), kept_decisions
+#
+#     print("❌ Final kept set is under budget/time but does not satisfy threshold.")
+#     print("↺ Trying fallback: lighter-upgrade links first...")
+#
+#     (
+#         fallback_ok,
+#         fallback_links,
+#         fallback_decisions,
+#         fallback_bp,
+#         fallback_projected_cycle_opex,
+#         fallback_total_capex_workforce,
+#         fallback_total_downtime,
+#         fallback_opex_ok,
+#         fallback_capex_ok,
+#         fallback_total_ok,
+#         fallback_time_ok,
+#     ) = _run_fallback_light_links_first(
+#         link_rows=link_rows,
+#         current_time=current_time,
+#         current_link_status_forward=current_link_status_forward,
+#         current_link_status_backward=current_link_status_backward,
+#         PATHS=PATHS,
+#         traffic_base=traffic_base,
+#         seed=seed,
+#         algorithm=algorithm,
+#         budget_params=budget_params,
+#     )
+#
+#     if fallback_ok:
+#         print("✅ PLAN CHECKER PASSED — fallback kept set satisfies performance and constraints.")
+#
+#         _append_plan_checker_log_row(
+#             current_time=current_time,
+#             status="PASS",
+#             reason="Fallback lighter-link set satisfies performance and constraints",
+#             baseline_bp=fallback_bp,
+#             threshold=blocked_connection_prob_threshold_plan_checker,
+#             selected_links=passed_links,
+#             kept_links=fallback_links,
+#             projected_cycle_opex=fallback_projected_cycle_opex,
+#             total_capex_workforce=fallback_total_capex_workforce,
+#             total_downtime=fallback_total_downtime,
+#             opex_ok=fallback_opex_ok,
+#             capex_ok=fallback_capex_ok,
+#             total_ok=fallback_total_ok,
+#             time_ok=fallback_time_ok,
+#         )
+#         return True, fallback_links, fallback_decisions
+#
+#     _append_plan_checker_log_row(
+#         current_time=current_time,
+#         status="FAIL",
+#         reason="Final kept set and fallback lighter-link set both fail performance",
+#         baseline_bp=final_bp,
+#         threshold=blocked_connection_prob_threshold_plan_checker,
+#         selected_links=passed_links,
+#         kept_links=kept_links,
+#         projected_cycle_opex=projected_cycle_opex,
+#         total_capex_workforce=total_capex_workforce,
+#         total_downtime=total_downtime,
+#         opex_ok=opex_ok,
+#         capex_ok=capex_ok,
+#         total_ok=total_ok,
+#         time_ok=time_ok,
+#     )
+#     return False, list(kept_decisions.keys()), kept_decisions
+#
+#
+# # import copy
+# # import csv
+# # import random
+# # from pathlib import Path
+# #
+# # from sim.core import topology as Topology
+# # from sim.upgrade.upgrade_manager import (
+# #     reset_all_slots_empty,
+# #     perform_upgrade,
+# #     choose_upgrade_type,
+# # )
+# # from sim.upgrade.cost_model import compute_upgrade_costs
+# # from sim.routing.rsa import execute_first_fit
+# # from sim.core.traffic_generator import NetworkTrafficGenerator
+# # from sim.core.constants import *
+# # from sim.upgrade.opex_model import compute_network_opex_per_day
+# # from sim.core import blocked_connection_prob_threshold_plan_checker
+# #
+# #
+# # # =====================================================================
+# # # Logging helpers
+# # # =====================================================================
+# #
+# # def _get_plan_checker_log_path() -> Path:
+# #     return Path("results") / "plan_checker_log.csv"
+# #
+# #
+# # def _init_plan_checker_log_if_needed():
+# #     log_path = _get_plan_checker_log_path()
+# #     if not log_path.exists():
+# #         log_path.parent.mkdir(parents=True, exist_ok=True)
+# #         with open(log_path, "w", newline="", encoding="utf-8") as f:
+# #             writer = csv.writer(f)
+# #             writer.writerow([
+# #                 "time_day",
+# #                 "status",
+# #                 "reason",
+# #                 "baseline_bp",
+# #                 "threshold",
+# #                 "selected_links",
+# #                 "kept_links",
+# #                 "projected_cycle_opex",
+# #                 "total_capex_workforce",
+# #                 "total_downtime",
+# #                 "opex_ok",
+# #                 "capex_ok",
+# #                 "total_ok",
+# #                 "time_ok",
+# #             ])
+# #
+# #
+# # def _append_plan_checker_log_row(
+# #     current_time,
+# #     status,
+# #     reason,
+# #     baseline_bp,
+# #     threshold,
+# #     selected_links,
+# #     kept_links,
+# #     projected_cycle_opex="",
+# #     total_capex_workforce="",
+# #     total_downtime="",
+# #     opex_ok="",
+# #     capex_ok="",
+# #     total_ok="",
+# #     time_ok="",
+# # ):
+# #     _init_plan_checker_log_if_needed()
+# #     with open(_get_plan_checker_log_path(), "a", newline="", encoding="utf-8") as f:
+# #         writer = csv.writer(f)
+# #         writer.writerow([
+# #             current_time,
+# #             status,
+# #             reason,
+# #             baseline_bp,
+# #             threshold,
+# #             list(selected_links) if selected_links is not None else [],
+# #             list(kept_links) if kept_links is not None else [],
+# #             projected_cycle_opex,
+# #             total_capex_workforce,
+# #             total_downtime,
+# #             opex_ok,
+# #             capex_ok,
+# #             total_ok,
+# #             time_ok,
+# #         ])
+# #
+# #
+# # # =====================================================================
+# # # Downtime / cost / budget helpers
+# # # =====================================================================
+# #
+# # def _get_upgrade_downtime_days_local(dec, algorithm_name):
+# #     """
+# #     Local downtime mapping so plan_checker.py does not depend on a helper
+# #     hidden elsewhere.
+# #     """
+# #     if dec is None:
+# #         return 0.0
+# #
+# #     utype = dec.get("upgrade_type")
+# #
+# #     if utype == "new_fiber_C":
+# #         return float(t_C1)
+# #     if utype == "new_fiber_CL":
+# #         return float(t_CL1)
+# #     if utype == "band_upgrade":
+# #         return float(t_b)
+# #     if utype == "core_upgrade":
+# #         return float(t_3C)
+# #
+# #     return 0.0
+# #
+# #
+# # def _compute_cycle_budget_components(current_time, current_link_status_forward, budget_params=None):
+# #     """
+# #     Returns budgets for the current cycle:
+# #       - OPEX budget
+# #       - CAPEX + workforce budget
+# #       - TOTAL budget
+# #     """
+# #     if budget_params is None:
+# #         raise ValueError("budget_params cannot be None")
+# #
+# #     period_days = int(budget_params["period_days"])
+# #     inflation_rate = float(budget_params["inflation_rate"])
+# #
+# #     period_idx = int(current_time // period_days)
+# #     growth = (1.0 + inflation_rate) ** period_idx
+# #
+# #     current_opex_budget = float(budget_params["period_opex_budget_0"]) * growth
+# #     current_capex_budget = float(budget_params["period_capex_budget_0"]) * growth
+# #     current_total_budget = float(budget_params["period_total_budget_0"]) * growth
+# #
+# #     return current_opex_budget, current_capex_budget, current_total_budget
+# #
+# #
+# # def _compute_total_downtime(cum_upgrade_decisions, algorithm_name):
+# #     """
+# #     Sum downtime over all upgrade decisions on all selected links.
+# #     """
+# #     total_downtime = 0.0
+# #
+# #     for _, decs in cum_upgrade_decisions.items():
+# #         if decs is None:
+# #             continue
+# #
+# #         if isinstance(decs, dict):
+# #             decs = [decs]
+# #
+# #         for dec in decs:
+# #             total_downtime += _get_upgrade_downtime_days_local(dec, algorithm_name)
+# #
+# #     return total_downtime
+# #
+# #
+# # def _compute_total_capex_workforce(cum_upgrade_decisions, algorithm_name):
+# #     """
+# #     Compute total equipment + workforce cost for the cumulative selected set.
+# #     """
+# #     safe_links_for_upgrade = list(cum_upgrade_decisions.keys())
+# #
+# #     if not safe_links_for_upgrade:
+# #         return 0.0, {"equipment_total": 0.0, "workforce_total": 0.0}, {}
+# #
+# #     total_cost, cost_summary, cost_details = compute_upgrade_costs(
+# #         safe_links_for_upgrade=safe_links_for_upgrade,
+# #         upgrade_decisions=cum_upgrade_decisions,
+# #         algorithm_name=algorithm_name
+# #     )
+# #
+# #     total_capex_workforce = (
+# #         float(cost_summary.get("equipment_total", 0.0))
+# #         + float(cost_summary.get("workforce_total", 0.0))
+# #     )
+# #
+# #     return total_capex_workforce, cost_summary, cost_details
+# #
+# #
+# # def _compute_projected_cycle_opex(cum_forward):
+# #     """
+# #     Compute projected OPEX for one upgrade-initiation cycle under the
+# #     currently selected upgraded state.
+# #     """
+# #     daily_opex = float(compute_network_opex_per_day(cum_forward))
+# #     period_opex = daily_opex * float(Upgrade_initiation_days)
+# #     return daily_opex, period_opex
+# #
+# #
+# # def _constraints_ok(
+# #     cum_upgrade_decisions,
+# #     cum_forward,
+# #     current_time,
+# #     current_link_status_forward,
+# #     algorithm_name,
+# #     budget_params=None
+# # ):
+# #     """
+# #     Check all constraints:
+# #       - OPEX budget
+# #       - CAPEX + workforce budget
+# #       - TOTAL budget
+# #       - Total downtime
+# #     """
+# #     total_capex_workforce, cost_summary, cost_details = _compute_total_capex_workforce(
+# #         cum_upgrade_decisions,
+# #         algorithm_name
+# #     )
+# #
+# #     total_downtime = _compute_total_downtime(cum_upgrade_decisions, algorithm_name)
+# #
+# #     daily_opex, projected_cycle_opex = _compute_projected_cycle_opex(cum_forward)
+# #
+# #     current_opex_budget, current_capex_budget, current_total_budget = _compute_cycle_budget_components(
+# #         current_time,
+# #         current_link_status_forward,
+# #         budget_params
+# #     )
+# #
+# #     total_projected_spending = projected_cycle_opex + total_capex_workforce
+# #
+# #     opex_ok = projected_cycle_opex <= current_opex_budget
+# #     capex_ok = total_capex_workforce <= current_capex_budget
+# #     total_ok = total_projected_spending <= current_total_budget
+# #     time_ok = total_downtime <= Upgrade_initiation_days
+# #
+# #     print(f"   → Daily OPEX under current upgraded state: {daily_opex:.2f}")
+# #     print(f"   → Projected OPEX for this {Upgrade_initiation_days}-day cycle: {projected_cycle_opex:.2f}")
+# #     print(f"   → OPEX budget for cycle: {current_opex_budget:.2f}")
+# #     print(f"   → CAPEX + Workforce spent: {total_capex_workforce:.2f}")
+# #     print(f"   → CAPEX + Workforce budget for cycle: {current_capex_budget:.2f}")
+# #     print(f"   → Total projected spending this cycle: {total_projected_spending:.2f}")
+# #     print(f"   → Total budget for cycle: {current_total_budget:.2f}")
+# #     print(f"   → Total downtime: {total_downtime:.2f} days")
+# #     print(f"   → OPEX constraint: {'PASS' if opex_ok else 'FAIL'}")
+# #     print(f"   → CAPEX/WF constraint: {'PASS' if capex_ok else 'FAIL'}")
+# #     print(f"   → TOTAL budget constraint: {'PASS' if total_ok else 'FAIL'}")
+# #     print(f"   → Time constraint: {'PASS' if time_ok else 'FAIL'}")
+# #
+# #     return (
+# #         opex_ok,
+# #         capex_ok,
+# #         total_ok,
+# #         time_ok,
+# #         projected_cycle_opex,
+# #         total_capex_workforce,
+# #         total_downtime,
+# #         cost_summary,
+# #         cost_details
+# #     )
+# #
+# #
+# # def _canonicalize_link_decisions(dec_list):
+# #     """
+# #     Clean one link's ordered decision list.
+# #
+# #     Rules:
+# #       1) remove invalid decisions
+# #       2) merge consecutive:
+# #             new_fiber_C(f) + band_upgrade(f) -> new_fiber_CL(f)
+# #       3) if a core_upgrade exists, drop everything before the first core_upgrade
+# #          but keep core_upgrade and all later steps
+# #     """
+# #     if not dec_list:
+# #         return []
+# #
+# #     # keep only valid decisions
+# #     cleaned = [d for d in dec_list if d is not None and d.get("upgrade_type") is not None]
+# #     if not cleaned:
+# #         return []
+# #
+# #     # merge new_fiber_C + band_upgrade on same fiber -> new_fiber_CL
+# #     merged = []
+# #     i = 0
+# #     while i < len(cleaned):
+# #         d1 = cleaned[i]
+# #
+# #         if i + 1 < len(cleaned):
+# #             d2 = cleaned[i + 1]
+# #
+# #             if (
+# #                 d1.get("upgrade_type") == "new_fiber_C"
+# #                 and d2.get("upgrade_type") == "band_upgrade"
+# #                 and d1.get("fiber_id") == d2.get("fiber_id")
+# #             ):
+# #                 merged.append({
+# #                     "upgrade_type": "new_fiber_CL",
+# #                     "fiber_id": d1.get("fiber_id"),
+# #                     "core_type": d1.get("core_type"),
+# #                 })
+# #                 i += 2
+# #                 continue
+# #
+# #         merged.append(d1)
+# #         i += 1
+# #
+# #     # if core_upgrade exists, drop everything before the first one
+# #     core_idx = None
+# #     for idx, d in enumerate(merged):
+# #         if d.get("upgrade_type") == "core_upgrade":
+# #             core_idx = idx
+# #             break
+# #
+# #     if core_idx is not None:
+# #         merged = merged[core_idx:]
+# #
+# #     return merged
+# #
+# #
+# # def _normalize_upgrade_decisions(upgrade_decisions):
+# #     """
+# #     Normalize and canonicalize per-link decision lists.
+# #     """
+# #     normalized = {}
+# #
+# #     for link, decs in upgrade_decisions.items():
+# #         if decs is None:
+# #             continue
+# #
+# #         if isinstance(decs, dict):
+# #             decs = [decs]
+# #
+# #         canonical = _canonicalize_link_decisions(list(decs))
+# #
+# #         if canonical:
+# #             normalized[link] = canonical
+# #
+# #     return normalized
+# #
+# #
+# # def _compute_single_link_capex_workforce(link_id, link_decisions, algorithm_name):
+# #     """
+# #     Compute equipment + workforce for one link's already-decided upgrade list.
+# #     """
+# #     total_cost, cost_summary, cost_details = compute_upgrade_costs(
+# #         safe_links_for_upgrade=[link_id],
+# #         upgrade_decisions={link_id: link_decisions},
+# #         algorithm_name=algorithm_name
+# #     )
+# #
+# #     return (
+# #         float(cost_summary.get("equipment_total", 0.0))
+# #         + float(cost_summary.get("workforce_total", 0.0))
+# #     )
+# #
+# #
+# # # =====================================================================
+# # # Blocking simulation
+# # # =====================================================================
+# #
+# # def run_planchecker_simulation(
+# #     forward_status_pc,
+# #     backward_status_pc,
+# #     traffic_matrix_pc,
+# #     PATHS,
+# #     start_time_pc,
+# #     seed
+# # ):
+# #     """
+# #     Boolean pass/fail wrapper retained for compatibility.
+# #     """
+# #     bp = evaluate_blocking_probability(
+# #         forward_status_pc=forward_status_pc,
+# #         backward_status_pc=backward_status_pc,
+# #         traffic_matrix_pc=traffic_matrix_pc,
+# #         PATHS=PATHS,
+# #         start_time_pc=start_time_pc,
+# #         seed=seed
+# #     )
+# #     return bp <= blocked_connection_prob_threshold_plan_checker
+# #
+# #
+# # def evaluate_blocking_probability(
+# #     forward_status_pc,
+# #     backward_status_pc,
+# #     traffic_matrix_pc,
+# #     PATHS,
+# #     start_time_pc,
+# #     seed
+# # ):
+# #     """
+# #     Runs a projection-window traffic simulation and returns blocking probability.
+# #     """
+# #     testing_topology = Topology.TOPOLOGY
+# #
+# #     # Project ahead by one upgrade cycle, then test for one traffic-growth window
+# #     start_pc = start_time_pc + Upgrade_initiation_days
+# #     current_time_pc = start_pc
+# #     SIM_END_pc = start_pc + Traffic_growth_days
+# #
+# #     pc_rng = random.Random(seed + 5555)
+# #
+# #     tg_pc = NetworkTrafficGenerator(
+# #         number_of_nodes=Topology.N,
+# #         datarates=DATARATE,
+# #         lambda_0=lambda_0,
+# #         mean_holding_time=MEAN_HOLDING_TIME,
+# #         Current_global_time=start_pc,
+# #         rng=pc_rng
+# #     )
+# #
+# #     ALL_DEMANDS_PLAN_CHECKER = []
+# #     blocked_pc = 0
+# #     total_pc = 0
+# #     next_growth_time_pc = start_pc + Traffic_growth_days
+# #
+# #     while True:
+# #         while current_time_pc >= next_growth_time_pc:
+# #             for i in range(Topology.N):
+# #                 for j in range(Topology.N):
+# #                     if i != j:
+# #                         growth = 1 + pc_rng.uniform(0, alpha / 100)
+# #                         traffic_matrix_pc[i][j] *= growth
+# #                         traffic_matrix_pc[i][j] *= (1 + delta / 100)
+# #             next_growth_time_pc += Traffic_growth_days
+# #
+# #         src_pc, dest_pc, rate_pc = tg_pc.generate_connection_data()
+# #         lam = traffic_matrix_pc[src_pc][dest_pc]
+# #         arrival_time_pc, holding_time_pc = tg_pc.get_connection(lam)
+# #         current_time_pc = arrival_time_pc
+# #
+# #         if current_time_pc >= SIM_END_pc:
+# #             break
+# #
+# #         departure_time_pc = arrival_time_pc + holding_time_pc
+# #         total_pc += 1
+# #
+# #         index_to_remove_plan_checker = []
+# #
+# #         for idp, conn_pc in enumerate(ALL_DEMANDS_PLAN_CHECKER):
+# #             if conn_pc.departure_time_pc <= current_time_pc:
+# #                 index_to_remove_plan_checker.append(idp)
+# #
+# #         for idp in reversed(index_to_remove_plan_checker):
+# #             conn_pc = ALL_DEMANDS_PLAN_CHECKER[idp]
+# #
+# #             for i in range(len(conn_pc.path_pc) - 1):
+# #                 src_depart = conn_pc.path_pc[i]
+# #                 dest_depart = conn_pc.path_pc[i + 1]
+# #
+# #                 link_pc = conn_pc.link_ids_pc[i]
+# #                 fiber_pc = conn_pc.fibers_used_pc[i]
+# #                 core_pc = conn_pc.cores_used_pc[i]
+# #
+# #                 if src_depart < dest_depart:
+# #                     if link_pc in forward_status_pc and fiber_pc in forward_status_pc[link_pc]:
+# #                         fwd_obj = forward_status_pc[link_pc][fiber_pc]
+# #
+# #                         if isinstance(fwd_obj, dict) and "slots" in fwd_obj:
+# #                             for s in range(conn_pc.fs_pc, conn_pc.fs_pc + conn_pc.sw_pc):
+# #                                 fwd_obj["slots"][s] = 0
+# #                         else:
+# #                             if core_pc in fwd_obj:
+# #                                 for s in range(conn_pc.fs_pc, conn_pc.fs_pc + conn_pc.sw_pc):
+# #                                     fwd_obj[core_pc]["slots"][s] = 0
+# #                 else:
+# #                     if link_pc in backward_status_pc and fiber_pc in backward_status_pc[link_pc]:
+# #                         bwd_obj = backward_status_pc[link_pc][fiber_pc]
+# #
+# #                         if isinstance(bwd_obj, dict) and "slots" in bwd_obj:
+# #                             for s in range(conn_pc.fs_pc, conn_pc.fs_pc + conn_pc.sw_pc):
+# #                                 bwd_obj["slots"][s] = 0
+# #                         else:
+# #                             if core_pc in bwd_obj:
+# #                                 for s in range(conn_pc.fs_pc, conn_pc.fs_pc + conn_pc.sw_pc):
+# #                                     bwd_obj[core_pc]["slots"][s] = 0
+# #
+# #             del ALL_DEMANDS_PLAN_CHECKER[idp]
+# #
+# #         mf_pc, fs_pc, sw_pc, path_pc, fibers_used_pc, cores_used_pc, link_ids_pc, attempted_paths_info_pc = execute_first_fit(
+# #             src=src_pc,
+# #             dest=dest_pc,
+# #             datarate=rate_pc,
+# #             arrival_time=arrival_time_pc,
+# #             departure_time=departure_time_pc,
+# #             link_status_forward=forward_status_pc,
+# #             link_status_backward=backward_status_pc,
+# #             topology=testing_topology,
+# #             PATHS=PATHS
+# #         )
+# #
+# #         if mf_pc == float("inf") or fs_pc == float("inf"):
+# #             blocked_pc += 1
+# #         else:
+# #             ALL_DEMANDS_PLAN_CHECKER.append(
+# #                 ConnectionData_plan_checker(
+# #                     path_pc, link_ids_pc, fs_pc, sw_pc, mf_pc,
+# #                     arrival_time_pc, holding_time_pc, departure_time_pc,
+# #                     rate_pc, fibers_used_pc, cores_used_pc
+# #                 )
+# #             )
+# #
+# #     blocking_probability_pc = (blocked_pc / total_pc) if total_pc > 0 else 1.0
+# #
+# #     print(f"   → Total requests tested: {total_pc}")
+# #     print(f"   → Blocked connections: {blocked_pc}")
+# #     print(f"   → Blocking probability: {blocking_probability_pc:.4f}")
+# #
+# #     return blocking_probability_pc
+# #
+# #
+# # def plan_checker(
+# #         safe_links,
+# #         upgrade_decisions,
+# #         current_time,
+# #         PATHS,
+# #         current_traffic,
+# #         current_link_status_forward,
+# #         current_link_status_backward,
+# #         seed,
+# #         algorithm,
+# #         budget_params=None
+# # ):
+# #     print("\n▶ RUNNING PLAN CHECKER...")
+# #
+# #     # ------------------------------------------------------------
+# #     # Step 0: normalize decisions from main.py
+# #     # ------------------------------------------------------------
+# #     full_decisions = _normalize_upgrade_decisions(upgrade_decisions)
+# #
+# #     if not full_decisions:
+# #         print("❌ No valid upgrade decisions received.")
+# #         _append_plan_checker_log_row(
+# #             current_time=current_time,
+# #             status="FAIL",
+# #             reason="No valid upgrade decisions received",
+# #             baseline_bp="",
+# #             threshold=blocked_connection_prob_threshold_plan_checker,
+# #             selected_links=[],
+# #             kept_links=[]
+# #         )
+# #         return False, {}
+# #
+# #     # Keep input ordering from main.py
+# #     full_links = [lid for lid in safe_links if lid in full_decisions]
+# #     if not full_links:
+# #         full_links = list(full_decisions.keys())
+# #
+# #     # ------------------------------------------------------------
+# #     # Step 1: create cumulative state from initial decisions
+# #     # ------------------------------------------------------------
+# #     cum_forward = copy.deepcopy(current_link_status_forward)
+# #     cum_backward = copy.deepcopy(current_link_status_backward)
+# #     cum_forward, cum_backward = reset_all_slots_empty(cum_forward, cum_backward)
+# #
+# #     perform_upgrade(
+# #         full_links,
+# #         full_decisions,
+# #         cum_forward,
+# #         cum_backward,
+# #         C_BAND_SLOTS,
+# #         TOTAL_SLOTS,
+# #         current_time,
+# #         algorithm
+# #     )
+# #     print("✓ Applied full candidate upgrade set from main.py")
+# #
+# #     # project traffic one cycle ahead
+# #     traffic_base = current_traffic.copy()
+# #     steps = int(Upgrade_initiation_days / Traffic_growth_days)
+# #     growth_factor_pc = ((1 + alpha / 100) * (1 + delta / 100)) ** steps
+# #     traffic_base *= growth_factor_pc
+# #
+# #     print(f"✓ Traffic projected +{Upgrade_initiation_days} days ahead")
+# #
+# #     # cumulative decisions that may grow in progressive rounds
+# #     cum_upgrade_decisions = copy.deepcopy(full_decisions)
+# #
+# #     # ------------------------------------------------------------
+# #     # Step 2: progressive multi-round escalation if performance fails
+# #     # ------------------------------------------------------------
+# #     round_idx = 0
+# #
+# #     while True:
+# #         baseline_bp = evaluate_blocking_probability(
+# #             forward_status_pc=copy.deepcopy(cum_forward),
+# #             backward_status_pc=copy.deepcopy(cum_backward),
+# #             traffic_matrix_pc=traffic_base.copy(),
+# #             PATHS=PATHS,
+# #             start_time_pc=current_time,
+# #             seed=seed
+# #         )
+# #
+# #         print(f"✓ Current cumulative blocking probability = {baseline_bp:.6f}")
+# #
+# #         if baseline_bp <= blocked_connection_prob_threshold_plan_checker:
+# #             print("\n" + "-" * 80)
+# #             print("✓ PLAN CHECKER: PERFORMANCE PASSES")
+# #             print("-" * 80)
+# #             print(f"→ Current day        : {current_time}")
+# #             print(f"→ Blocking           : {baseline_bp:.6f}")
+# #             print(f"→ Threshold          : {blocked_connection_prob_threshold_plan_checker:.6f}")
+# #             print(f"→ Candidate links    : {list(cum_upgrade_decisions.keys())}")
+# #             print("-" * 80 + "\n")
+# #             break
+# #
+# #         # performance failed -> log and escalate one more round for all links
+# #         round_idx += 1
+# #         print("\n" + "=" * 80)
+# #         print(f"❌ PLAN CHECKER PERFORMANCE FAILED — STARTING ROUND #{round_idx} ESCALATION")
+# #         print("=" * 80)
+# #         print(f"→ Current simulation day           : {current_time}")
+# #         print(f"→ Blocking threshold               : {blocked_connection_prob_threshold_plan_checker:.6f}")
+# #         print(f"→ Achieved blocking                : {baseline_bp:.6f}")
+# #         print("→ Escalating next upgrade decision for all eligible links")
+# #         print("=" * 80 + "\n")
+# #
+# #         round_upgrades = {}
+# #
+# #         for link in full_links:
+# #             upg = choose_upgrade_type(
+# #                 link,
+# #                 cum_forward,
+# #                 cum_backward,
+# #                 algorithm
+# #             )
+# #
+# #             if upg is None or upg.get("upgrade_type") is None:
+# #                 continue
+# #
+# #             round_upgrades[link] = upg
+# #
+# #         if not round_upgrades:
+# #             print("⚠️ No further upgrades possible on any selected link.")
+# #             _append_plan_checker_log_row(
+# #                 current_time=current_time,
+# #                 status="FAIL",
+# #                 reason="Performance failed and no further upgrades possible",
+# #                 baseline_bp=baseline_bp,
+# #                 threshold=blocked_connection_prob_threshold_plan_checker,
+# #                 selected_links=list(cum_upgrade_decisions.keys()),
+# #                 kept_links=[]
+# #             )
+# #             return False, cum_upgrade_decisions
+# #
+# #         print(f"✓ Selected next upgrades for {len(round_upgrades)} links in escalation round #{round_idx}")
+# #
+# #         for link, upg in round_upgrades.items():
+# #             if link not in cum_upgrade_decisions:
+# #                 cum_upgrade_decisions[link] = []
+# #             elif isinstance(cum_upgrade_decisions[link], dict):
+# #                 cum_upgrade_decisions[link] = [cum_upgrade_decisions[link]]
+# #             elif cum_upgrade_decisions[link] is None:
+# #                 cum_upgrade_decisions[link] = []
+# #
+# #             cum_upgrade_decisions[link].append(upg)
+# #
+# #             # IMPORTANT:
+# #             # Immediately canonicalize after appending, so:
+# #             #   new_fiber_C + band_upgrade on same fiber -> new_fiber_CL
+# #             #   anything before core_upgrade is removed
+# #             cum_upgrade_decisions[link] = _canonicalize_link_decisions(cum_upgrade_decisions[link])
+# #
+# #         # rebuild cumulative network state cleanly from scratch
+# #         cum_forward = copy.deepcopy(current_link_status_forward)
+# #         cum_backward = copy.deepcopy(current_link_status_backward)
+# #         cum_forward, cum_backward = reset_all_slots_empty(cum_forward, cum_backward)
+# #
+# #         perform_upgrade(
+# #             list(cum_upgrade_decisions.keys()),
+# #             cum_upgrade_decisions,
+# #             cum_forward,
+# #             cum_backward,
+# #             C_BAND_SLOTS,
+# #             TOTAL_SLOTS,
+# #             current_time,
+# #             algorithm
+# #         )
+# #
+# #     # ------------------------------------------------------------
+# #     # Step 3: remove-one-link contribution scoring on final passing set
+# #     # ------------------------------------------------------------
+# #     passed_links = list(cum_upgrade_decisions.keys())
+# #     passed_decisions = copy.deepcopy(cum_upgrade_decisions)
+# #
+# #     link_rows = []
+# #
+# #     total_cost_all, total_summary_all, total_cost_details_all = compute_upgrade_costs(
+# #         safe_links_for_upgrade=passed_links,
+# #         upgrade_decisions=passed_decisions,
+# #         algorithm_name=algorithm.name
+# #     )
+# #
+# #     for link in passed_links:
+# #         reduced_decisions = copy.deepcopy(passed_decisions)
+# #         removed_link_decisions = reduced_decisions.pop(link, None)
+# #
+# #         if not removed_link_decisions:
+# #             continue
+# #
+# #         reduced_links = list(reduced_decisions.keys())
+# #
+# #         reduced_forward = copy.deepcopy(current_link_status_forward)
+# #         reduced_backward = copy.deepcopy(current_link_status_backward)
+# #         reduced_forward, reduced_backward = reset_all_slots_empty(reduced_forward, reduced_backward)
+# #
+# #         if reduced_links:
+# #             perform_upgrade(
+# #                 reduced_links,
+# #                 reduced_decisions,
+# #                 reduced_forward,
+# #                 reduced_backward,
+# #                 C_BAND_SLOTS,
+# #                 TOTAL_SLOTS,
+# #                 current_time,
+# #                 algorithm
+# #             )
+# #
+# #         bp_without_link = evaluate_blocking_probability(
+# #             forward_status_pc=copy.deepcopy(reduced_forward),
+# #             backward_status_pc=copy.deepcopy(reduced_backward),
+# #             traffic_matrix_pc=traffic_base.copy(),
+# #             PATHS=PATHS,
+# #             start_time_pc=current_time,
+# #             seed=seed
+# #         )
+# #
+# #         contribution = bp_without_link - baseline_bp
+# #
+# #         # use full link cost from cost_details if available
+# #         if link in total_cost_details_all:
+# #             link_cost = float(total_cost_details_all[link].get("link_total_cost", 0.0))
+# #         else:
+# #             link_cost = _compute_single_link_capex_workforce(
+# #                 link_id=link,
+# #                 link_decisions=removed_link_decisions,
+# #                 algorithm_name=algorithm.name
+# #             )
+# #
+# #         if link_cost <= 0:
+# #             continue
+# #
+# #         efficiency = contribution / link_cost
+# #
+# #         link_rows.append({
+# #             "link": link,
+# #             "decisions": removed_link_decisions,
+# #             "bp_without_link": bp_without_link,
+# #             "contribution": contribution,
+# #             "cost": link_cost,
+# #             "efficiency": efficiency,
+# #         })
+# #
+# #     if not link_rows:
+# #         print("❌ No valid link-level contribution rows could be computed.")
+# #         _append_plan_checker_log_row(
+# #             current_time=current_time,
+# #             status="FAIL",
+# #             reason="No valid link-level contribution rows",
+# #             baseline_bp=baseline_bp,
+# #             threshold=blocked_connection_prob_threshold_plan_checker,
+# #             selected_links=passed_links,
+# #             kept_links=[]
+# #         )
+# #         return False, {}
+# #
+# #     # ------------------------------------------------------------
+# #     # Step 4: sort by contribution per dollar
+# #     # ------------------------------------------------------------
+# #     link_rows.sort(key=lambda x: x["efficiency"], reverse=True)
+# #
+# #     print("✓ Ranked links by contribution per dollar:")
+# #     for row in link_rows:
+# #         print(
+# #             f"   link {row['link']}: "
+# #             f"bp_without={row['bp_without_link']:.6f}, "
+# #             f"contribution={row['contribution']:.6f}, "
+# #             f"cost={row['cost']:.2f}, "
+# #             f"eff={row['efficiency']:.12f}"
+# #         )
+# #
+# #     # ------------------------------------------------------------
+# #     # Step 5: keep links greedily under budget/time
+# #     # ------------------------------------------------------------
+# #     kept_decisions = {}
+# #
+# #     for row in link_rows:
+# #         trial_kept = copy.deepcopy(kept_decisions)
+# #         trial_kept[row["link"]] = row["decisions"]
+# #
+# #         trial_links = list(trial_kept.keys())
+# #
+# #         trial_forward = copy.deepcopy(current_link_status_forward)
+# #         trial_backward = copy.deepcopy(current_link_status_backward)
+# #         trial_forward, trial_backward = reset_all_slots_empty(trial_forward, trial_backward)
+# #
+# #         perform_upgrade(
+# #             trial_links,
+# #             trial_kept,
+# #             trial_forward,
+# #             trial_backward,
+# #             C_BAND_SLOTS,
+# #             TOTAL_SLOTS,
+# #             current_time,
+# #             algorithm
+# #         )
+# #
+# #         (
+# #             opex_ok,
+# #             capex_ok,
+# #             total_ok,
+# #             time_ok,
+# #             projected_cycle_opex,
+# #             total_capex_workforce,
+# #             total_downtime,
+# #             cost_summary,
+# #             cost_details
+# #         ) = _constraints_ok(
+# #             cum_upgrade_decisions=trial_kept,
+# #             cum_forward=trial_forward,
+# #             current_time=current_time,
+# #             current_link_status_forward=current_link_status_forward,
+# #             algorithm_name=algorithm.name,
+# #             budget_params=budget_params
+# #         )
+# #
+# #         if opex_ok and capex_ok and total_ok and time_ok:
+# #             kept_decisions = trial_kept
+# #             print(f"   → Keeping link {row['link']}")
+# #         else:
+# #             print(f"\n   ❌ REJECTING LINK {row['link']}")
+# #             print(f"      → Cost        : {row['cost']:.2f}")
+# #             print(f"      → Efficiency  : {row['efficiency']:.10f}")
+# #             print(f"      → OPEX OK     : {opex_ok}")
+# #             print(f"      → CAPEX OK    : {capex_ok}")
+# #             print(f"      → TOTAL OK    : {total_ok}")
+# #             print(f"      → TIME OK     : {time_ok}")
+# #
+# #     if not kept_decisions:
+# #         print("❌ No links remain after budget/time pruning.")
+# #         _append_plan_checker_log_row(
+# #             current_time=current_time,
+# #             status="FAIL",
+# #             reason="All links rejected by budget/time pruning",
+# #             baseline_bp=baseline_bp,
+# #             threshold=blocked_connection_prob_threshold_plan_checker,
+# #             selected_links=passed_links,
+# #             kept_links=[]
+# #         )
+# #         return False, {}
+# #
+# #     # ------------------------------------------------------------
+# #     # Step 6: final performance check on kept set
+# #     # ------------------------------------------------------------
+# #     kept_links = list(kept_decisions.keys())
+# #
+# #     final_forward = copy.deepcopy(current_link_status_forward)
+# #     final_backward = copy.deepcopy(current_link_status_backward)
+# #     final_forward, final_backward = reset_all_slots_empty(final_forward, final_backward)
+# #
+# #     perform_upgrade(
+# #         kept_links,
+# #         kept_decisions,
+# #         final_forward,
+# #         final_backward,
+# #         C_BAND_SLOTS,
+# #         TOTAL_SLOTS,
+# #         current_time,
+# #         algorithm
+# #     )
+# #
+# #     final_bp = evaluate_blocking_probability(
+# #         forward_status_pc=copy.deepcopy(final_forward),
+# #         backward_status_pc=copy.deepcopy(final_backward),
+# #         traffic_matrix_pc=traffic_base.copy(),
+# #         PATHS=PATHS,
+# #         start_time_pc=current_time,
+# #         seed=seed
+# #     )
+# #
+# #     print(f"✓ Final kept-set blocking probability = {final_bp:.6f}")
+# #
+# #     (
+# #         opex_ok,
+# #         capex_ok,
+# #         total_ok,
+# #         time_ok,
+# #         projected_cycle_opex,
+# #         total_capex_workforce,
+# #         total_downtime,
+# #         cost_summary,
+# #         cost_details
+# #     ) = _constraints_ok(
+# #         cum_upgrade_decisions=kept_decisions,
+# #         cum_forward=final_forward,
+# #         current_time=current_time,
+# #         current_link_status_forward=current_link_status_forward,
+# #         algorithm_name=algorithm.name,
+# #         budget_params=budget_params
+# #     )
+# #
+# #     if final_bp <= blocked_connection_prob_threshold_plan_checker:
+# #         print("✅ PLAN CHECKER PASSED — final kept set satisfies performance and constraints.")
+# #
+# #         _append_plan_checker_log_row(
+# #             current_time=current_time,
+# #             status="PASS",
+# #             reason="Final kept set satisfies performance and constraints",
+# #             baseline_bp=final_bp,
+# #             threshold=blocked_connection_prob_threshold_plan_checker,
+# #             selected_links=passed_links,
+# #             kept_links=kept_links,
+# #             projected_cycle_opex=projected_cycle_opex,
+# #             total_capex_workforce=total_capex_workforce,
+# #             total_downtime=total_downtime,
+# #             opex_ok=opex_ok,
+# #             capex_ok=capex_ok,
+# #             total_ok=total_ok,
+# #             time_ok=time_ok,
+# #         )
+# #         return True, kept_decisions
+# #
+# #     print("❌ Final kept set is under budget/time but does not satisfy threshold.")
+# #
+# #     _append_plan_checker_log_row(
+# #         current_time=current_time,
+# #         status="FAIL",
+# #         reason="Final kept set under budget/time but fails performance",
+# #         baseline_bp=final_bp,
+# #         threshold=blocked_connection_prob_threshold_plan_checker,
+# #         selected_links=passed_links,
+# #         kept_links=kept_links,
+# #         projected_cycle_opex=projected_cycle_opex,
+# #         total_capex_workforce=total_capex_workforce,
+# #         total_downtime=total_downtime,
+# #         opex_ok=opex_ok,
+# #         capex_ok=capex_ok,
+# #         total_ok=total_ok,
+# #         time_ok=time_ok,
+# #     )
+# #     return False, kept_decisions
