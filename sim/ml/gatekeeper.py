@@ -46,7 +46,6 @@ def validate_dataset(df, feature_cols, target_col):
             errors.append("Some link technology features contain negative values!")
 
     # Check 5: Target column values (must be 0 or 1)
-    
     if not df[target_col].isin([0, 1]).all():
         errors.append(f"Target column '{target_col}' contains values other than 0 or 1!")
 
@@ -64,25 +63,20 @@ def validate_dataset(df, feature_cols, target_col):
 # =====================================================================
 # 2. DATA LOADING & COLUMN IDENTIFICATION
 # =====================================================================
-# Gets the directory where train_gatekeeper.py is located
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Points to the Test folder inside ML: .../ml/Test/sample_test.csv
-file_path = os.path.join(SCRIPT_DIR, "XGBOOST", "Increment_dataset.csv")
+file_path = os.path.join(SCRIPT_DIR, "no_upgrade_dataset.csv")
 
 print(f"Loading data from: {file_path}")
 try:
-    df = pd.read_csv(file_path) #, sheet_name=sheet_name)
+    df = pd.read_csv(file_path)
     print(f"Successfully loaded dataset: {df.shape[0]} Rows x {df.shape[1]} Columns\n")
 except Exception as e:
-    print(f" Error loading Excel file: {e}")
+    print(f" Error loading CSV file: {e}")
     sys.exit(1)
 
-# Metadata columns MUST be excluded from feature set (X)
 metadata_cols = ["seed", "split", "algorithm", "cycle_number", "current_day"]
 target_col = "upgrade_needed"
 
-# Dynamically select all feature columns (609 features)
 feature_cols = [c for c in df.columns if c not in metadata_cols + [target_col]]
 
 print(f"Metadata Columns (Excluded from training): {metadata_cols}")
@@ -101,7 +95,6 @@ if not validate_dataset(df, feature_cols, target_col):
 # =====================================================================
 # 4. TRAIN / TEST SPLITTING BY SEED
 # =====================================================================
-# Train: Seeds 1 to 15 | Test: Seeds 16 to 20
 train_df = df[df["split"] == "train"]
 test_df = df[df["split"] == "test"]
 
@@ -111,7 +104,6 @@ X_test, y_test = test_df[feature_cols], test_df[target_col]
 print(f"Train Set Shape: {X_train.shape[0]} rows x {X_train.shape[1]} features (Seeds 0–14)")
 print(f"Test Set Shape:  {X_test.shape[0]} rows x {X_test.shape[1]} features (Seeds 15–19)\n")
 
-# Compute scale_pos_weight for handling class imbalance (0s vs 1s)
 num_zeros = (y_train == 0).sum()
 num_ones = (y_train == 1).sum()
 pos_ratio = num_zeros / num_ones if num_ones > 0 else 1.0
@@ -123,15 +115,15 @@ print(f"Calculated scale_pos_weight: {pos_ratio:.2f}\n")
 # 5. INITIALIZE & TRAIN XGBOOST MODEL
 # =====================================================================
 model = xgb.XGBClassifier(
-    n_estimators=200,            # Max number of decision trees
-    max_depth=5,                 # Depth of each tree (prevents overfitting)
-    learning_rate=0.03,          # Step size shrinkage
-    subsample=0.8,               # Sample 80% of rows per tree
-    colsample_bytree=0.8,        # Sample 80% of features per tree
-    scale_pos_weight=pos_ratio,  # Adjusts weights for imbalanced upgrade labels
+    n_estimators=200,
+    max_depth=5,
+    learning_rate=0.03,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    scale_pos_weight=pos_ratio,
     random_state=42,
     eval_metric="logloss",
-    early_stopping_rounds=20     # Stops early if test loss stops improving
+    early_stopping_rounds=20
 )
 
 print("Starting XGBoost Model Training...")
@@ -148,19 +140,32 @@ print("Training completed!\n")
 # 6. EVALUATE PREDICTIONS ON HELD-OUT TEST SET
 # =====================================================================
 y_pred = model.predict(X_test)
-y_probs = model.predict_proba(X_test)[:, 1]
+y_probs = model.predict_proba(X_test)[:, 1] if hasattr(model, "predict_proba") else y_pred
 
 print("=" * 60)
 print("                    EVALUATION RESULTS                       ")
 print("=" * 60)
 print(f"Test Accuracy: {accuracy_score(y_test, y_pred) * 100:.2f}%")
-print(f"ROC-AUC Score: {roc_auc_score(y_test, y_probs):.4f}\n")
+
+# ROC-AUC requires both classes (0 and 1) to be present in y_test
+if len(np.unique(y_test)) > 1:
+    print(f"ROC-AUC Score: {roc_auc_score(y_test, y_probs):.4f}\n")
+else:
+    print("ROC-AUC Score: N/A (Only 1 class present in test set)\n")
 
 print("Classification Report:")
-print(classification_report(y_test, y_pred, target_names=["No Upgrade Needed (0)", "Upgrade Needed (1)"]))
+print(
+    classification_report(
+        y_test, 
+        y_pred, 
+        labels=[0, 1], 
+        target_names=["No Upgrade Needed (0)", "Upgrade Needed (1)"],
+        zero_division=0
+    )
+)
 
 print("Confusion Matrix:")
-cm = confusion_matrix(y_test, y_pred)
+cm = confusion_matrix(y_test, y_pred, labels=[0, 1])
 print(f"[[ True Negatives (0s): {cm[0][0]} | False Positives (0s as 1): {cm[0][1]} ]")
 print(f" [ False Negatives (1s as 0): {cm[1][0]} | True Positives (1s): {cm[1][1]} ]]\n")
 
@@ -186,3 +191,38 @@ model.save_model(output_model_name)
 print("\n" + "=" * 60)
 print(f"✅ Model exported successfully as '{output_model_name}'!")
 print("=" * 60)
+
+
+# =====================================================================
+# 9. LIVE INFERENCE FUNCTION & MULTI-CYCLE EVALUATION
+# =====================================================================
+def evaluate_gatekeeper_sample(gatekeeper_model, sample_row, feature_names):
+    live_bbp = float(sample_row["current_BBP"])
+    sample_features = sample_row[feature_names].values.reshape(1, -1)
+    
+    upgrade_needed = int(gatekeeper_model.predict(sample_features)[0])
+    
+    if hasattr(gatekeeper_model, "predict_proba"):
+        upgrade_probability = float(gatekeeper_model.predict_proba(sample_features)[0][1])
+    else:
+        upgrade_probability = float(upgrade_needed)
+    
+    return upgrade_needed, live_bbp, upgrade_probability
+
+
+print("\n" + "=" * 60)
+print("     EVALUATING GATEKEEPER ACROSS TEST CYCLES (SEEDS 15-19)     ")
+print("=" * 60)
+
+# Iterate through test set rows to see evolving BBP across cycles
+for idx, row in test_df.iterrows():
+    pred_upgrade, live_bbp, prob = evaluate_gatekeeper_sample(
+        model, row, feature_cols
+    )
+    actual_label = int(row[target_col])
+    
+    print(
+        f"Seed: {int(row['seed']):2d} | Cycle: {int(row['cycle_number']):2d} | "
+        f"Live BBP: {live_bbp:.6f} | Gatekeeper Decision: {pred_upgrade} | "
+        f"Actual: {actual_label}"
+    )
