@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Dict, Tuple, Any, Optional
 import time
 from collections import defaultdict
+import xgboost as xgb
 
 
 # ============================================================================
@@ -392,9 +393,14 @@ def initialize_simulation(config: Dict[str, Any]):
 # Main Simulation Logic
 # ============================================================================
 
-def run_simulation(config: Dict[str, Any]):
+# ============================================================================
+# Modularized Simulation Core
+# ============================================================================
+
+def initialize_simulation_state(config: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Run the optical network simulation with given configuration.
+    Initializes topology, traffic matrices, data loggers, and metrics.
+    Returns a unified state dictionary for DRL training or standalone evaluation.
     """
     topology_data, algorithm, results_dir, config = initialize_simulation(config)
     upgrade_log_csv = config["upgrade_log_csv"]
@@ -419,13 +425,13 @@ def run_simulation(config: Dict[str, Any]):
     # Wall-clock runtime measurement
     start_wall_time = time.time()
 
-    print("="*70)
+    print("=" * 70)
     print("OPTICAL NETWORK SIMULATOR")
-    print("="*70)
+    print("=" * 70)
     print(f"Topology: {config['topology']}")
     print(f"Algorithm: {algorithm.name}")
     print(f"Seed: {config['seed']}")
-    print("="*70 + "\n")
+    print("=" * 70 + "\n")
 
     # Extract topology information
     TOPOLOGY = topology_data['TOPOLOGY']
@@ -450,35 +456,24 @@ def run_simulation(config: Dict[str, Any]):
     metrics = PerformanceMetrics()
     analysis = SimulationAnalysis()
 
-    # ============================================================
-    # PATH STATISTICS (NO lambda)
-    # key = (undirected_s, undirected_d, path_index)
-    # ============================================================
-
     path_stats = {}
-    # Full-history path statistics across the whole simulation
     path_stats_history = {}
 
     # Initialize network state
-    total_network_cost = 0
+    total_network_cost = 0.0
     upgrade_cost_timeline = []
     connection_id = 0
     upgrade_decision_history = []
     budget_tracker = {}
     removed_links_info = {}
-    Current_global_time = 0
+    Current_global_time = 0.0
     current_week = 0
     current_upgrade = 0
     last_cost_time = 0.0
     last_logged_day = -1
 
-    # >>> CHANGE 3 START: persistent downtime JOB queue (does not reset each cycle)
-    # This holds entries like:
-    #   ("fiber", link_id, decision_dict)
-    #   ("link",  link_id, [decision_dict, decision_dict, ...])   # core first
     link_execution_queue = []
     per_link_jobs = {}
-    # >>> CHANGE 3 END
 
     # Validate traffic parameters
     if lambda_0 <= 0:
@@ -513,90 +508,27 @@ def run_simulation(config: Dict[str, Any]):
     if not link_status_forward or not link_status_backward:
         raise ValueError("Link status initialization returned empty dicts")
 
-    # ============================================================
-    # MAX-INITIAL: apply one-time day-0 CAPEX + workforce
-    # ============================================================
-    if algorithm.name == "max_initial":
-        # Build synthetic upgrade decisions for ALL links.
-        # We use a single core_upgrade per link and let cost_model compute
-        # the full jump-to-max cost via algorithm_name="jump_to_max".
-        initial_upgrade_decisions = {}
-
-        for link_id in range(LINKS):
-            initial_upgrade_decisions[link_id] = [
-                {
-                    "upgrade_type": "core_upgrade",
-                    "fiber_id": None,
-                    "core_type": 1
-                }
-            ]
-
-        initial_links = list(initial_upgrade_decisions.keys())
-
-        initial_cost, cost_summary, cost_details = compute_upgrade_costs(
-            safe_links_for_upgrade=initial_links,
-            upgrade_decisions=initial_upgrade_decisions,
-            algorithm_name="jump_to_max"   # use jump-to-max costing for max-initial baseline
-        )
-
-        total_network_cost += float(initial_cost)
-
-        upgrade_cost_timeline.append({
-            "day": 0.0,
-            "equipment": float(cost_summary.get("equipment_total", 0.0)),
-            "workforce": float(cost_summary.get("workforce_total", 0.0)),
-            "opex": 0.0,
-            "total": float(initial_cost),
-            "cumulative_total": float(total_network_cost),
-        })
-
-        print(f"[max_initial] Day-0 CAPEX + workforce applied: {initial_cost:.2f}")
-        print(f"[max_initial] Equipment: {cost_summary.get('equipment_total', 0.0):.2f}")
-        print(f"[max_initial] Workforce: {cost_summary.get('workforce_total', 0.0):.2f}")
-
-    # ------------------------------------------------------------
-    # COMMON budget envelope
-    # - OPEX budget is derived from actual initial network OPEX
-    # - CAPEX/WF budget is a policy value based on your upgrade-budget constants
-    # ------------------------------------------------------------
     initial_daily_opex = float(compute_network_opex_per_day(link_status_forward))
 
-    # ------------------------------------------------------------
-    # Budget parameters by topology
-    #   - test5  -> base budget
-    #   - dt12   -> 3x of test5 budget
-    # ------------------------------------------------------------
     base_budget_params = {
-        "period_days": int(Upgrade_initiation_days),  # 180
+        "period_days": int(Upgrade_initiation_days),
         "period_total_budget_0": 750_0000.0,
         "period_opex_budget_0": 100_0000.0,
         "period_capex_budget_0": 650_0000.0,
-        "inflation_rate": 0.03,  # annual inflation
+        "inflation_rate": 0.03,
     }
 
     if config["topology"] == "test5":
         budget_params = base_budget_params
-
     elif config["topology"] == "dt12":
-        dt12_multiplier = 3.0  # try 2.0 first; later test 1.75 if needed
-
+        dt12_multiplier = 3.0
         budget_params = {
             "period_days": base_budget_params["period_days"],
             "period_total_budget_0": dt12_multiplier * base_budget_params["period_total_budget_0"],
             "period_opex_budget_0": dt12_multiplier * base_budget_params["period_opex_budget_0"],
             "period_capex_budget_0": dt12_multiplier * base_budget_params["period_capex_budget_0"],
-            "inflation_rate": base_budget_params["inflation_rate"],  # still annual
+            "inflation_rate": base_budget_params["inflation_rate"],
         }
-
-    # elif config["topology"] == "dt12":
-    #     budget_params = {
-    #         "period_days": base_budget_params["period_days"],
-    #         "period_total_budget_0": 12_000_000.0,
-    #         "period_opex_budget_0": 2_000_000.0,
-    #         "period_capex_budget_0": 10_000_000.0,
-    #         "inflation_rate": base_budget_params["inflation_rate"],
-    #     }
-
     else:
         raise ValueError(f"Unsupported topology for budget settings: {config['topology']}")
 
@@ -608,7 +540,6 @@ def run_simulation(config: Dict[str, Any]):
     print(f"Initial TOTAL budget / year         : {budget_params['period_total_budget_0']:.2f}")
     print(f"Upgrade check interval (days)       : {budget_params['period_days']}")
     print("-" * 50)
-    # Traffic generator
 
     traffic_generator = NetworkTrafficGenerator(
         number_of_nodes=N,
@@ -619,23 +550,332 @@ def run_simulation(config: Dict[str, Any]):
         rng=main_rng
     )
 
-    # Build paths
     PATHS = build_k_shortest_paths(TOPOLOGY)
     if not PATHS:
         raise ValueError("build_k_shortest_paths() returned empty structure")
 
     print("✓ Simulation initialized\n")
-    print("Starting simulation loop...\n")
 
+    # Return unified state dictionary
+    return {
+        "config": config,
+        "algorithm": algorithm,
+        "results_dir": results_dir,
+        "topology_data": topology_data,
+        "TOPOLOGY": TOPOLOGY,
+        "TOPOLOGY_LINK_LENGTHS": TOPOLOGY_LINK_LENGTHS,
+        "LINK_INDEX": LINK_INDEX,
+        "N": N,
+        "LINKS": LINKS,
+        "seed": seed,
+        "main_rng": main_rng,
+        "metrics": metrics,
+        "analysis": analysis,
+        "traffic_rates": traffic_rates,
+        "ALL_DEMANDS": ALL_DEMANDS,
+        "working_topology": working_topology,
+        "link_status_forward": link_status_forward,
+        "link_status_backward": link_status_backward,
+        "PATHS": PATHS,
+        "traffic_generator": traffic_generator,
+        "budget_params": budget_params,
+        "path_stats": path_stats,
+        "path_stats_history": path_stats_history,
+        "total_network_cost": total_network_cost,
+        "upgrade_cost_timeline": upgrade_cost_timeline,
+        "connection_id": connection_id,
+        "upgrade_decision_history": upgrade_decision_history,
+        "budget_tracker": budget_tracker,
+        "removed_links_info": removed_links_info,
+        "Current_global_time": Current_global_time,
+        "current_week": current_week,
+        "current_upgrade": current_upgrade,
+        "last_cost_time": last_cost_time,
+        "last_logged_day": last_logged_day,
+        "current_month": current_month,
+        "MONTH_DAYS": MONTH_DAYS,
+        "link_execution_queue": link_execution_queue,
+        "per_link_jobs": per_link_jobs,
+        "start_wall_time": start_wall_time,
+        "util_csv": util_csv,
+        "frag_csv": frag_csv,
+        "daily_network_file": daily_network_file,
+        "daily_network_writer": daily_network_writer,
+        "pre_upgrade_per_link_file": pre_upgrade_per_link_file,
+        "pre_upgrade_per_link_writer": pre_upgrade_per_link_writer,
+        "upgrade_cycle_file": upgrade_cycle_file,
+        "upgrade_cycle_writer": upgrade_cycle_writer,
+        "connection_log_file": connection_log_file,
+        "connection_log_writer": connection_log_writer,
+        "upgrade_log_csv": upgrade_log_csv,
+    }
+
+    
+def start_next_link_job(
+        link_execution_queue,
+        per_link_jobs,
+        current_time,
+        period_index,
+        working_topology,
+        link_status_forward,
+        link_status_backward,
+        removed_links_info,
+        ALL_DEMANDS,
+        total_network_cost,
+        PATHS,
+        upgrade_log_csv,         
+        upgrade_cost_timeline,   
+        algorithm,
+):
+    """
+    Start the next link's downtime work only if no downtime is active.
+    """
+
+    if not link_execution_queue or removed_links_info:
+        return (
+            link_execution_queue,
+            per_link_jobs,
+            working_topology,
+            link_status_forward,
+            link_status_backward,
+            removed_links_info,
+            ALL_DEMANDS,
+            total_network_cost,
+            PATHS,
+        )
+
+    lid = link_execution_queue.pop(0)
+    decs = per_link_jobs.get(lid, [])
+
+    if not decs:
+        print(f">>> Link {lid} has no downtime jobs. Moving to next link.")
+        return (
+            link_execution_queue,
+            per_link_jobs,
+            working_topology,
+            link_status_forward,
+            link_status_backward,
+            removed_links_info,
+            ALL_DEMANDS,
+            total_network_cost,
+            PATHS,
+        )
+
+    has_core = any(d.get("upgrade_type") == "core_upgrade" for d in decs)
+
+    if has_core:
+        print(f">>> Starting LINK downtime job on link {lid}: {decs}")
+
+        for dec in decs:
+            log_upgrade_action(
+                upgrade_log_csv,
+                day=current_time,
+                period_index=period_index,
+                scope="link_downtime",
+                link_id=lid,
+                upgrade_type=dec.get("upgrade_type", ""),
+                fiber_id=dec.get("fiber_id", None),
+                core_type=dec.get("core_type", None),
+            )
+
+        decs = sorted(
+            decs,
+            key=lambda d: {
+                "core_upgrade": 0,
+                "band_upgrade": 1,
+                "new_fiber_CL": 2,
+            }.get(d.get("upgrade_type"), 99)
+        )
+
+        (
+            working_topology,
+            link_status_forward,
+            link_status_backward,
+            removed_links_info,
+            ALL_DEMANDS,
+            _,
+            _,
+            _,
+            total_network_cost,
+            PATHS,
+        ) = start_link_downtime_job(
+            link_id=lid,
+            decisions=decs,
+            pending_downtime_actions=None,
+            ALL_DEMANDS=ALL_DEMANDS,
+            link_status_forward=link_status_forward,
+            link_status_backward=link_status_backward,
+            working_topology=working_topology,
+            removed_links_info=removed_links_info,
+            current_time=current_time,
+            blocked_datarate_rerouting=0,
+            accepted_datarate_rerouting=0,
+            arrived_datarate_rerouting=0,
+            total_network_cost=total_network_cost,
+            upgrade_cost_timeline=upgrade_cost_timeline,
+            algorithm=algorithm,
+        )
+
+    else:
+        # NEW: treat ALL fiber-level decisions on this link as ONE combined job
+        print(f">>> Starting COMBINED FIBER downtime job on link {lid}: {decs}")
+
+        for dec in decs:
+            log_upgrade_action(
+                upgrade_log_csv,
+                day=current_time,
+                period_index=period_index,
+                scope="fiber_downtime",
+                link_id=lid,
+                upgrade_type=dec.get("upgrade_type", ""),
+                fiber_id=dec.get("fiber_id", None),
+                core_type=dec.get("core_type", None),
+            )
+
+        (
+            working_topology,
+            link_status_forward,
+            link_status_backward,
+            removed_links_info,
+            ALL_DEMANDS,
+            _,
+            _,
+            _,
+            total_network_cost,
+            PATHS,
+        ) = start_combined_fiber_downtime_job(
+            link_id=lid,
+            decisions=decs,
+            ALL_DEMANDS=ALL_DEMANDS,
+            link_status_forward=link_status_forward,
+            link_status_backward=link_status_backward,
+            working_topology=working_topology,
+            removed_links_info=removed_links_info,
+            current_time=current_time,
+            blocked_datarate_rerouting=0,
+            accepted_datarate_rerouting=0,
+            arrived_datarate_rerouting=0,
+            total_network_cost=total_network_cost,
+            upgrade_cost_timeline=upgrade_cost_timeline,
+            algorithm=algorithm,
+        )
+
+        per_link_jobs[lid] = []
+        # first_dec = decs[0]
+        # remaining = decs[1:]
+        #
+        # print(f">>> Starting FIBER downtime job on link {lid}: {first_dec}")
+        #
+        # log_upgrade_action(
+        #     upgrade_log_csv,
+        #     day=current_time,
+        #     period_index=period_index,
+        #     scope="fiber_downtime",
+        #     link_id=lid,
+        #     upgrade_type=first_dec.get("upgrade_type", ""),
+        #     fiber_id=first_dec.get("fiber_id", None),
+        #     core_type=first_dec.get("core_type", None),
+        # )
+        #
+        # (
+        #     working_topology,
+        #     link_status_forward,
+        #     link_status_backward,
+        #     removed_links_info,
+        #     ALL_DEMANDS,
+        #     _,
+        #     _,
+        #     _,
+        #     total_network_cost,
+        #     PATHS,
+        # ) = start_downtime_upgrade_for_link(
+        #     scope="fiber",
+        #     link_id=lid,
+        #     decision=first_dec,
+        #     pending_downtime_actions=None,
+        #     ALL_DEMANDS=ALL_DEMANDS,
+        #     link_status_forward=link_status_forward,
+        #     link_status_backward=link_status_backward,
+        #     working_topology=working_topology,
+        #     removed_links_info=removed_links_info,
+        #     current_time=current_time,
+        #     blocked_datarate_rerouting=0,
+        #     accepted_datarate_rerouting=0,
+        #     arrived_datarate_rerouting=0,
+        #     total_network_cost=total_network_cost,
+        #     upgrade_cost_timeline=upgrade_cost_timeline,
+        #     algorithm=algorithm,
+        # )
+        #
+        # if remaining:
+        #     per_link_jobs[lid] = remaining
+        #     link_execution_queue.insert(0, lid)
+        # else:
+        #     per_link_jobs[lid] = []
+
+    return (
+        link_execution_queue,
+        per_link_jobs,
+        working_topology,
+        link_status_forward,
+        link_status_backward,
+        removed_links_info,
+        ALL_DEMANDS,
+        total_network_cost,
+        PATHS,
+    )
+
+def run_single_cycle(state: Dict[str, Any], action: Optional[Any] = None) -> Tuple[Dict[str, Any], float, bool]:
+    """
+    Executes exactly ONE event step of the simulation loop.
+    Returns: (updated_state, reward, done)
+    """
+    # --- 1. UNPACK ENVIRONMENT STATE ---
+    config = state["config"]
+    algorithm = state["algorithm"]
+    TOPOLOGY = state["TOPOLOGY"]
+    LINK_INDEX = state["LINK_INDEX"]
+    N = state["N"]
+    LINKS = state["LINKS"]
+    seed = state["seed"]
+    main_rng = state["main_rng"]
+    metrics = state["metrics"]
+    traffic_rates = state["traffic_rates"]
+    ALL_DEMANDS = state["ALL_DEMANDS"]
+    working_topology = state["working_topology"]
+    link_status_forward = state["link_status_forward"]
+    link_status_backward = state["link_status_backward"]
+    PATHS = state["PATHS"]
+    traffic_generator = state["traffic_generator"]
+    budget_params = state["budget_params"]
+    path_stats = state["path_stats"]
+    path_stats_history = state["path_stats_history"]
+    total_network_cost = state["total_network_cost"]
+    upgrade_cost_timeline = state["upgrade_cost_timeline"]
+    connection_id = state["connection_id"]
+    upgrade_decision_history = state["upgrade_decision_history"]
+    budget_tracker = state["budget_tracker"]
+    removed_links_info = state["removed_links_info"]
+    Current_global_time = state["Current_global_time"]
+    current_week = state["current_week"]
+    current_upgrade = state["current_upgrade"]
+    last_cost_time = state["last_cost_time"]
+    last_logged_day = state["last_logged_day"]
+    current_month = state["current_month"]
+    MONTH_DAYS = state["MONTH_DAYS"]
+    link_execution_queue = state["link_execution_queue"]
+    per_link_jobs = state["per_link_jobs"]
+    util_csv = state["util_csv"]
+    frag_csv = state["frag_csv"]
+    daily_network_writer = state["daily_network_writer"]
+    pre_upgrade_per_link_writer = state["pre_upgrade_per_link_writer"]
+    upgrade_cycle_writer = state["upgrade_cycle_writer"]
+    connection_log_writer = state["connection_log_writer"]
+    upgrade_log_csv = state["upgrade_log_csv"]
+
+    # --- 2. INNER HELPER FUNCTIONS ---
     def account_running_opex_until(new_time: float):
-        """
-        Charges OPEX continuously, but logs it cleanly day-by-day:
-          - For each day boundary crossed, append one timeline entry
-          - Each daily entry contains the OPEX charged for that day segment
-          - Upgrade events are separate entries (CAPEX/workforce jumps)
-        """
-        nonlocal total_network_cost, last_cost_time, upgrade_cost_timeline, last_logged_day
-
+        nonlocal total_network_cost, last_cost_time, last_logged_day
         new_time = float(new_time)
         t = float(last_cost_time)
 
@@ -643,14 +883,12 @@ def run_simulation(config: Dict[str, Any]):
             return
 
         while t < new_time:
-            # next integer day boundary
             next_boundary = float(int(t) + 1)
             seg_end = min(new_time, next_boundary)
             dt = seg_end - t
             if dt <= 0:
                 break
 
-            # OPEX for this segment (rate based on CURRENT state)
             opex_inc = float(compute_running_opex_interval(link_status_forward, dt))
             total_network_cost += opex_inc
 
@@ -662,23 +900,21 @@ def run_simulation(config: Dict[str, Any]):
                     "day": float(day_marker),
                     "equipment": 0.0,
                     "workforce": 0.0,
-                    "opex": float(opex_inc),  # OPEX charged in this segment
-                    "opex_rate": float(opex_rate),  # informational
+                    "opex": float(opex_inc),
+                    "opex_rate": float(opex_rate),
                     "total": float(opex_inc),
                     "cumulative_total": float(total_network_cost),
                 })
                 last_logged_day = day_marker
                 log_daily_network_state(day_marker)
             else:
-                # same day marker: merge OPEX into the last row but keep total consistent
                 if upgrade_cost_timeline:
                     row = upgrade_cost_timeline[-1]
                     row["opex"] = float(row.get("opex", 0.0)) + float(opex_inc)
-
                     row["total"] = (
-                            float(row.get("equipment", 0.0))
-                            + float(row.get("workforce", 0.0))
-                            + float(row.get("opex", 0.0))
+                        float(row.get("equipment", 0.0))
+                        + float(row.get("workforce", 0.0))
+                        + float(row.get("opex", 0.0))
                     )
                     row["cumulative_total"] = float(total_network_cost)
 
@@ -708,11 +944,9 @@ def run_simulation(config: Dict[str, Any]):
         if not isinstance(fiber_obj, dict):
             return None
 
-        # -------- Single-core --------
         if "lit" in fiber_obj and "bands" in fiber_obj:
             if not fiber_obj.get("lit", False):
                 return None
-
             bands = set(fiber_obj.get("bands", []))
             if bands == {"C"}:
                 return "SC_C"
@@ -720,43 +954,32 @@ def run_simulation(config: Dict[str, Any]):
                 return "SC_CL"
             return None
 
-        # -------- Multi-core --------
         core_keys = [k for k in fiber_obj.keys() if isinstance(k, int)]
         if core_keys:
             lit_cores = []
             all_bands = set()
-
             for ck in core_keys:
                 core = fiber_obj.get(ck, {})
                 if isinstance(core, dict) and core.get("lit", False):
                     lit_cores.append(ck)
                     all_bands.update(core.get("bands", []))
-
             if not lit_cores:
                 return None
-
-            if "L" in all_bands:
-                return "MC_CL"
-            else:
-                return "MC_C"
-
+            return "MC_CL" if "L" in all_bands else "MC_C"
         return None
 
     def log_pre_upgrade_per_link_state(cycle_idx, time_day):
         for link_id, fibers in link_status_forward.items():
-
             sc_c = sc_cl = mc_c = mc_cl = 0
-
             for fiber_id, fiber_obj in fibers.items():
-                state = classify_fiber_state(fiber_obj)
-
-                if state == "SC_C":
+                f_state = classify_fiber_state(fiber_obj)
+                if f_state == "SC_C":
                     sc_c += 1
-                elif state == "SC_CL":
+                elif f_state == "SC_CL":
                     sc_cl += 1
-                elif state == "MC_C":
-                    mc_c += 3  # important rule
-                elif state == "MC_CL":
+                elif f_state == "MC_C":
+                    mc_c += 3
+                elif f_state == "MC_CL":
                     mc_cl += 3
 
             pre_upgrade_per_link_writer.writerow([
@@ -769,351 +992,107 @@ def run_simulation(config: Dict[str, Any]):
                 mc_cl,
             ])
 
-    def start_next_link_job(
-            link_execution_queue,
-            per_link_jobs,
-            current_time,
-            period_index,
-            working_topology,
-            link_status_forward,
-            link_status_backward,
-            removed_links_info,
-            ALL_DEMANDS,
-            total_network_cost,
-            PATHS,
-    ):
-        """
-        Start the next link's downtime work only if no downtime is active.
-        """
+    # --- 3. UNROLLED SINGLE CYCLE EVENT EXECUTION ---
+    # Weekly traffic growth
+    while (Current_global_time // Traffic_growth_days) > current_week:
+        print(f">>> Weekly traffic update at day {Current_global_time}")
+        current_week += 1
+        for i in range(N):
+            for j in range(N):
+                if i != j:
+                    growth_factor = 1 + main_rng.uniform(0, alpha / 100)
+                    traffic_rates[i][j] *= growth_factor
+                    traffic_rates[i][j] *= (1 + delta / 100)
 
-        if not link_execution_queue or removed_links_info:
-            return (
-                link_execution_queue,
-                per_link_jobs,
-                working_topology,
-                link_status_forward,
-                link_status_backward,
-                removed_links_info,
-                ALL_DEMANDS,
-                total_network_cost,
-                PATHS,
-            )
+    # Generate next request
+    src, dest, datarate = traffic_generator.generate_connection_data()
+    lambda_sd = traffic_rates[src][dest]
 
-        lid = link_execution_queue.pop(0)
-        decs = per_link_jobs.get(lid, [])
+    if lambda_sd <= 0:
+        raise ValueError("Invalid lambda_sd: must be non-zero and positive.")
 
-        if not decs:
-            print(f">>> Link {lid} has no downtime jobs. Moving to next link.")
-            return (
-                link_execution_queue,
-                per_link_jobs,
-                working_topology,
-                link_status_forward,
-                link_status_backward,
-                removed_links_info,
-                ALL_DEMANDS,
-                total_network_cost,
-                PATHS,
-            )
+    arrival_time, holding_time = traffic_generator.get_connection(lambda_sd)
+    Current_global_time = arrival_time
+    account_running_opex_until(Current_global_time)
+    departure_time = arrival_time + holding_time
+    period_index = int(Current_global_time // tau)
 
-        has_core = any(d.get("upgrade_type") == "core_upgrade" for d in decs)
-
-        if has_core:
-            print(f">>> Starting LINK downtime job on link {lid}: {decs}")
-
-            for dec in decs:
-                log_upgrade_action(
-                    upgrade_log_csv,
-                    day=current_time,
-                    period_index=period_index,
-                    scope="link_downtime",
-                    link_id=lid,
-                    upgrade_type=dec.get("upgrade_type", ""),
-                    fiber_id=dec.get("fiber_id", None),
-                    core_type=dec.get("core_type", None),
-                )
-
-            decs = sorted(
-                decs,
-                key=lambda d: {
-                    "core_upgrade": 0,
-                    "band_upgrade": 1,
-                    "new_fiber_CL": 2,
-                }.get(d.get("upgrade_type"), 99)
-            )
-
-            (
-                working_topology,
-                link_status_forward,
-                link_status_backward,
-                removed_links_info,
-                ALL_DEMANDS,
-                _,
-                _,
-                _,
-                total_network_cost,
-                PATHS,
-            ) = start_link_downtime_job(
-                link_id=lid,
-                decisions=decs,
-                pending_downtime_actions=None,
-                ALL_DEMANDS=ALL_DEMANDS,
-                link_status_forward=link_status_forward,
-                link_status_backward=link_status_backward,
-                working_topology=working_topology,
-                removed_links_info=removed_links_info,
-                current_time=current_time,
-                blocked_datarate_rerouting=0,
-                accepted_datarate_rerouting=0,
-                arrived_datarate_rerouting=0,
-                total_network_cost=total_network_cost,
-                upgrade_cost_timeline=upgrade_cost_timeline,
-                algorithm=algorithm,
-            )
-
-        else:
-            # NEW: treat ALL fiber-level decisions on this link as ONE combined job
-            print(f">>> Starting COMBINED FIBER downtime job on link {lid}: {decs}")
-
-            for dec in decs:
-                log_upgrade_action(
-                    upgrade_log_csv,
-                    day=current_time,
-                    period_index=period_index,
-                    scope="fiber_downtime",
-                    link_id=lid,
-                    upgrade_type=dec.get("upgrade_type", ""),
-                    fiber_id=dec.get("fiber_id", None),
-                    core_type=dec.get("core_type", None),
-                )
-
-            (
-                working_topology,
-                link_status_forward,
-                link_status_backward,
-                removed_links_info,
-                ALL_DEMANDS,
-                _,
-                _,
-                _,
-                total_network_cost,
-                PATHS,
-            ) = start_combined_fiber_downtime_job(
-                link_id=lid,
-                decisions=decs,
-                ALL_DEMANDS=ALL_DEMANDS,
-                link_status_forward=link_status_forward,
-                link_status_backward=link_status_backward,
-                working_topology=working_topology,
-                removed_links_info=removed_links_info,
-                current_time=current_time,
-                blocked_datarate_rerouting=0,
-                accepted_datarate_rerouting=0,
-                arrived_datarate_rerouting=0,
-                total_network_cost=total_network_cost,
-                upgrade_cost_timeline=upgrade_cost_timeline,
-                algorithm=algorithm,
-            )
-
-            per_link_jobs[lid] = []
-            # first_dec = decs[0]
-            # remaining = decs[1:]
-            #
-            # print(f">>> Starting FIBER downtime job on link {lid}: {first_dec}")
-            #
-            # log_upgrade_action(
-            #     upgrade_log_csv,
-            #     day=current_time,
-            #     period_index=period_index,
-            #     scope="fiber_downtime",
-            #     link_id=lid,
-            #     upgrade_type=first_dec.get("upgrade_type", ""),
-            #     fiber_id=first_dec.get("fiber_id", None),
-            #     core_type=first_dec.get("core_type", None),
-            # )
-            #
-            # (
-            #     working_topology,
-            #     link_status_forward,
-            #     link_status_backward,
-            #     removed_links_info,
-            #     ALL_DEMANDS,
-            #     _,
-            #     _,
-            #     _,
-            #     total_network_cost,
-            #     PATHS,
-            # ) = start_downtime_upgrade_for_link(
-            #     scope="fiber",
-            #     link_id=lid,
-            #     decision=first_dec,
-            #     pending_downtime_actions=None,
-            #     ALL_DEMANDS=ALL_DEMANDS,
-            #     link_status_forward=link_status_forward,
-            #     link_status_backward=link_status_backward,
-            #     working_topology=working_topology,
-            #     removed_links_info=removed_links_info,
-            #     current_time=current_time,
-            #     blocked_datarate_rerouting=0,
-            #     accepted_datarate_rerouting=0,
-            #     arrived_datarate_rerouting=0,
-            #     total_network_cost=total_network_cost,
-            #     upgrade_cost_timeline=upgrade_cost_timeline,
-            #     algorithm=algorithm,
-            # )
-            #
-            # if remaining:
-            #     per_link_jobs[lid] = remaining
-            #     link_execution_queue.insert(0, lid)
-            # else:
-            #     per_link_jobs[lid] = []
-
-        return (
-            link_execution_queue,
-            per_link_jobs,
-            working_topology,
-            link_status_forward,
-            link_status_backward,
-            removed_links_info,
-            ALL_DEMANDS,
-            total_network_cost,
-            PATHS,
+    # Monthly logging
+    month_idx = int(Current_global_time // MONTH_DAYS)
+    if month_idx > current_month:
+        current_month = month_idx
+        log_monthly_link_stats_rowwise(
+            time_day=Current_global_time,
+            LINKS=LINKS,
+            link_status_forward=link_status_forward,
+            link_status_backward=link_status_backward,
+            C_BAND_SLOTS=C_BAND_SLOTS,
+            TOTAL_SLOTS=TOTAL_SLOTS,
+            util_csv=util_csv,
+            frag_csv=frag_csv,
         )
 
-    while True:
+    connection_id += 1
 
-        # Weekly traffic growth
-        while (Current_global_time // Traffic_growth_days) > current_week:
-            print(f">>> Weekly traffic update at day {Current_global_time}")
-            current_week += 1
+    # Upgrade Cycle Check (every 3 months)
+    if (Current_global_time // Upgrade_initiation_days) > current_upgrade:
+        print(f"\n=== Upgrade cycle triggered at day {Current_global_time} ===")
+        current_upgrade += 1
 
-            for i in range(N):
-                for j in range(N):
-                    if i != j:
-                        growth_factor = 1 + main_rng.uniform(0, alpha / 100)
-                        traffic_rates[i][j] *= growth_factor
+        print(">>> Checking whether upgrade is needed...")
+        upgrade_needed = algorithm.check_need_for_upgrade(        
+            current_traffic=traffic_rates,
+            current_time=Current_global_time,
+            PATHS=PATHS,
+            current_link_status_forward=copy.deepcopy(link_status_forward),
+            current_link_status_backward=copy.deepcopy(link_status_backward),
+            seed=seed
+        )
 
-            for i in range(N):
-                for j in range(N):
-                    if i != j:
-                        growth_factor_new = (1 + delta / 100)
-                        traffic_rates[i][j] *= growth_factor_new
+        print(f">>> Upgrade needed = {upgrade_needed}")
 
-        # Generate next request
-        src, dest, datarate = traffic_generator.generate_connection_data()
-        lambda_sd = traffic_rates[src][dest]
-
-        if lambda_sd <= 0:
-            raise ValueError("Invalid lambda_sd: must be non-zero and positive.")
-
-        arrival_time, holding_time = traffic_generator.get_connection(lambda_sd)
-        Current_global_time = arrival_time
-        # ✅ OPEX from last time -> now
-        account_running_opex_until(Current_global_time)
-        departure_time = arrival_time + holding_time
-        period_index = int(Current_global_time // tau)
-
-        # Monthly logging
-        month_idx = int(Current_global_time // MONTH_DAYS)
-        if month_idx > current_month:
-            current_month = month_idx
-            log_monthly_link_stats_rowwise(
-                time_day=Current_global_time,
-                LINKS=LINKS,
+        if config.get("collect_xgboost_data", False):
+            xgb_csv_path = config["results_dir"] / config.get("xgboost_csv_name", "xgboost_need_upgrade_dataset.csv")
+            append_xgboost_row(
+                csv_path=xgb_csv_path,
+                seed=seed,
+                algorithm_name=algorithm.name,
+                cycle_number=current_upgrade,
+                current_day=Current_global_time,
+                current_blocking_probability=metrics.get_blocking_probability(),
+                traffic_rates=traffic_rates,
                 link_status_forward=link_status_forward,
-                link_status_backward=link_status_backward,
-                C_BAND_SLOTS=C_BAND_SLOTS,
-                TOTAL_SLOTS=TOTAL_SLOTS,
-                util_csv=util_csv,
-                frag_csv=frag_csv,
+                upgrade_needed=upgrade_needed,
+                classify_fiber_state=classify_fiber_state,
             )
 
-        connection_id += 1
+        if upgrade_needed:
+            sd_last_block_prob = copy.deepcopy(metrics.get_sd_blocking_probability())
+            metrics.sd_arrivals.clear()
+            metrics.sd_blocked.clear()
 
-        # ====================================================================
-        # Upgrade Cycle Check (every 3 months)
-        # ====================================================================
+            plan_ok = False
+            final_links = []
+            final_upgrade_decisions = {}
 
-        if (Current_global_time // Upgrade_initiation_days) > current_upgrade:
-            print(f"\n=== Upgrade cycle triggered at day {Current_global_time} ===")
-            current_upgrade += 1
-
-            print(">>> Checking whether upgrade is needed...")
-            upgrade_needed = algorithm.check_need_for_upgrade(
-                current_traffic=traffic_rates,
-                current_time=Current_global_time,
-                PATHS=PATHS,
-                current_link_status_forward=copy.deepcopy(link_status_forward),
-                current_link_status_backward=copy.deepcopy(link_status_backward),
-                seed=seed
-            )
-
-            print(f">>> Upgrade needed = {upgrade_needed}")
-
-            # ============================================================
-            # XGBOOST DATA COLLECTION
-            # One row per upgrade-check cycle, before applying upgrades
-            # ============================================================
-            if config.get("collect_xgboost_data", False):
-                xgb_csv_path = (
-                        config["results_dir"]
-                        / config.get("xgboost_csv_name", "xgboost_need_upgrade_dataset.csv")
-                )
-
-                append_xgboost_row(
-                    csv_path=xgb_csv_path,
+            if action is not None and config.get("algorithm") == "drl":
+                safe_links, upgrade_decisions = action
+                plan_ok, final_links, final_upgrade_decisions = plan_checker(
+                    safe_links=safe_links,
+                    upgrade_decisions=upgrade_decisions,
+                    current_time=Current_global_time,
+                    PATHS=PATHS,
+                    current_traffic=traffic_rates,
+                    current_link_status_forward=copy.deepcopy(link_status_forward),
+                    current_link_status_backward=copy.deepcopy(link_status_backward),
                     seed=seed,
-                    algorithm_name=algorithm.name,
-                    cycle_number=current_upgrade,
-                    current_day=Current_global_time,
-                    current_blocking_probability=metrics.get_blocking_probability(),
-                    traffic_rates=traffic_rates,
-                    link_status_forward=link_status_forward,
-                    upgrade_needed=upgrade_needed,
-                    classify_fiber_state=classify_fiber_state,
+                    algorithm=algorithm,
+                    budget_params=budget_params,
+                    budget_selection_mode=config.get("budget_selection_mode", "budget_aware"),
+                    budget_tracker=budget_tracker,
                 )
-
-                print(f">>> XGBoost data row saved: {xgb_csv_path}")
-
-                # ============================================================
-                # DEBUG STOP: stop after a few upgrade-check cycles
-                # Use this only to verify the XGBoost CSV.
-                # ============================================================
-                max_debug_cycles = config.get("max_upgrade_cycles_for_debug", None)
-
-                if max_debug_cycles is not None and current_upgrade >= max_debug_cycles:
-                    print(
-                        f">>> DEBUG STOP: reached {current_upgrade} upgrade cycles. "
-                        f"Stopping early so you can inspect the XGBoost CSV."
-                    )
-                    break
-
-            if upgrade_needed:
-                sd_last_block_prob = copy.deepcopy(metrics.get_sd_blocking_probability())
-
-                # Clear SD stats once for the next measurement window.
-                # sd_last_block_prob is already copied and will be reused for all path-rank retries.
-                metrics.sd_arrivals.clear()
-                metrics.sd_blocked.clear()
-
-                # ============================================================
-                # Retry over congestion-ranked paths
-                # ============================================================
-
-                plan_ok = False
-                final_links = []
-                final_upgrade_decisions = {}
-
+            else:
                 for path_rank in range(3):
-
-                    print("\n" + "=" * 60)
-                    print(f">>> TRYING path_rank = {path_rank}")
-                    print("=" * 60)
-
-                    # --------------------------------------------------------
-                    # Select candidate links
-                    # --------------------------------------------------------
-
                     upgrade_links, link_scores, top_contrib = algorithm.select_links_for_upgrade(
                         traffic_rates=traffic_rates,
                         PATHS=PATHS,
@@ -1126,135 +1105,30 @@ def run_simulation(config: Dict[str, Any]):
                         current_time=Current_global_time,
                         path_stats=path_stats,
                         path_rank=path_rank,
-                        link_selection_mode=config.get(
-                            "link_selection_mode",
-                            "path_congestion"
-                        ),
-                        link_score_threshold=config.get(
-                            "link_score_threshold",
-                            PER_SD_BLOCK_THRESHOLD
-                        ),
+                        link_selection_mode=config.get("link_selection_mode", "path_congestion"),
+                        link_score_threshold=config.get("link_score_threshold", PER_SD_BLOCK_THRESHOLD),
                     )
-
-                    print(f">>> Selected links = {upgrade_links}")
 
                     if not upgrade_links:
-                        print(f">>> No upgrade links found for path_rank={path_rank}")
                         continue
 
-                    # --------------------------------------------------------
-                    # Connectivity-safe links
-                    # --------------------------------------------------------
-
-                    safe_links = network_connectivity(
-                        upgrade_links,
-                        working_topology,
-                        LINK_INDEX
-                    )
-
-                    print(f">>> Safe links = {safe_links}")
-
-                    safe_links = sorted(
-                        safe_links,
-                        key=lambda lid: float(link_scores.get(lid, 0.0)),
-                        reverse=True
-                    )
-
-                    print(f">>> Safe links after sorting = {safe_links}")
-
-                    # --------------------------------------------------------
-                    # Build upgrade decisions
-                    # --------------------------------------------------------
+                    safe_links = network_connectivity(upgrade_links, working_topology, LINK_INDEX)
+                    safe_links = sorted(safe_links, key=lambda lid: float(link_scores.get(lid, 0.0)), reverse=True)
 
                     if config['algorithm'] == 'greedy':
-
-                        upgrade_decisions = {}
-
-                        for link_id in safe_links:
-
-                            decs = choose_upgrade_type_greedy_max(
-                                link_id,
-                                link_status_forward,
-                                link_status_backward
-                            )
-
-                            if decs is None:
-                                upgrade_decisions[link_id] = []
-
-                            elif isinstance(decs, dict):
-                                upgrade_decisions[link_id] = [decs]
-
-                            else:
-                                upgrade_decisions[link_id] = list(decs)
-
+                        upgrade_decisions = {lid: choose_upgrade_type_greedy_max(lid, link_status_forward, link_status_backward) for lid in safe_links}
                     elif config['algorithm'] == 'jump_to_max':
-
-                        upgrade_decisions = {}
-
-                        for link_id in safe_links:
-
-                            decs = algorithm.get_upgrade_decision(
-                                link_id,
-                                link_status_forward,
-                                link_status_backward
-                            )
-
-                            if decs is None:
-                                upgrade_decisions[link_id] = []
-
-                            elif isinstance(decs, dict):
-                                upgrade_decisions[link_id] = [decs]
-
-                            else:
-                                upgrade_decisions[link_id] = list(decs)
-
+                        upgrade_decisions = {lid: algorithm.get_upgrade_decision(lid, link_status_forward, link_status_backward) for lid in safe_links}
                     elif config['algorithm'] == 'random':
-
-                        upgrade_decisions = {}
-
-                        for link_id in safe_links:
-
-                            decs = algorithm.get_random_upgrade_decision(
-                                link_id,
-                                link_status_forward
-                            )
-
-                            if decs is None:
-                                upgrade_decisions[link_id] = []
-
-                            elif isinstance(decs, dict):
-                                upgrade_decisions[link_id] = [decs]
-
-                            else:
-                                upgrade_decisions[link_id] = list(decs)
-
+                        upgrade_decisions = {lid: algorithm.get_random_upgrade_decision(lid, link_status_forward) for lid in safe_links}
                     else:
+                        upgrade_decisions = {lid: choose_upgrade_type(lid, link_status_forward, link_status_backward, algorithm) for lid in safe_links}
 
-                        upgrade_decisions = {}
-
-                        for link_id in safe_links:
-
-                            decs = choose_upgrade_type(
-                                link_id,
-                                link_status_forward,
-                                link_status_backward,
-                                algorithm
-                            )
-
-                            if decs is None:
-                                upgrade_decisions[link_id] = []
-
-                            elif isinstance(decs, dict):
-                                upgrade_decisions[link_id] = [decs]
-
-                            else:
-                                upgrade_decisions[link_id] = list(decs)
-
-                    # --------------------------------------------------------
-                    # Run PlanChecker
-                    # --------------------------------------------------------
-
-                    print(f">>> Running PlanChecker for path_rank={path_rank}")
+                    for lid in upgrade_decisions:
+                        if upgrade_decisions[lid] is None:
+                            upgrade_decisions[lid] = []
+                        elif isinstance(upgrade_decisions[lid], dict):
+                            upgrade_decisions[lid] = [upgrade_decisions[lid]]
 
                     plan_ok, candidate_links, candidate_upgrade_decisions = plan_checker(
                         safe_links=safe_links,
@@ -1267,454 +1141,382 @@ def run_simulation(config: Dict[str, Any]):
                         seed=seed,
                         algorithm=algorithm,
                         budget_params=budget_params,
-                        budget_selection_mode=config.get(
-                            "budget_selection_mode",
-                            "budget_aware"
-                        ),
+                        budget_selection_mode=config.get("budget_selection_mode", "budget_aware"),
                         budget_tracker=budget_tracker,
                     )
 
                     if plan_ok:
-
-                        print(f">>> PlanChecker PASSED for path_rank={path_rank}")
-
                         final_links = candidate_links
                         final_upgrade_decisions = candidate_upgrade_decisions
-
                         break
 
+            if plan_ok:
+                path_stats.clear()
+                safe_links = final_links
+                upgrade_decisions = final_upgrade_decisions
+                flat_final_decisions = flatten_upgrade_decisions(upgrade_decisions)
+
+                log_pre_upgrade_per_link_state(cycle_idx=current_upgrade, time_day=Current_global_time)
+
+                upgrade_decision_history.append({
+                    "cycle": int(current_upgrade),
+                    "time_day": float(Current_global_time),
+                    "blocking_probability": float(metrics.get_blocking_probability()),
+                    "final_decisions": flat_final_decisions,
+                    "cycle_upgrade_level": get_cycle_upgrade_level(flat_final_decisions),
+                })
+
+                upgrade_cycle_writer.writerow([
+                    int(current_upgrade),
+                    float(Current_global_time),
+                    float(metrics.get_blocking_probability()),
+                    len(safe_links),
+                    str(list(safe_links)),
+                    str(flat_final_decisions),
+                    get_cycle_upgrade_level(flat_final_decisions),
+                ])
+                print_upgrade_decisions_summary(Current_global_time, safe_links, upgrade_decisions)
+
+                immediate_actions = {}
+                per_link_jobs = {}
+
+                for lid in safe_links:
+                    decs = upgrade_decisions.get(lid, [])
+                    decs = [decs] if isinstance(decs, dict) else list(decs)
+                    has_core = any(d.get("upgrade_type") == "core_upgrade" for d in decs)
+
+                    immediate_actions[lid] = []
+                    per_link_jobs[lid] = []
+
+                    if has_core:
+                        per_link_jobs[lid] = list(decs)
                     else:
+                        for dec in decs:
+                            if dec is None or dec.get("upgrade_type") is None:
+                                continue
+                            utype = dec.get("upgrade_type")
+                            if utype == "new_fiber_C":
+                                immediate_actions[lid].append(dec)
+                            else:
+                                per_link_jobs[lid].append(dec)
 
-                        print(f">>> PlanChecker FAILED for path_rank={path_rank}")
+                immediate_actions = {lid: decs for lid, decs in immediate_actions.items() if decs}
+                per_link_jobs = {lid: decs for lid, decs in per_link_jobs.items() if decs}
+                link_execution_queue = [lid for lid in safe_links if lid in per_link_jobs]
 
-                # ============================================================
-                # Final result after retries
-                # ============================================================
+                cycle_actions = {}
+                for lid, decs in immediate_actions.items():
+                    cycle_actions.setdefault(lid, []).extend(decs)
+                for lid, decs in per_link_jobs.items():
+                    cycle_actions.setdefault(lid, []).extend(decs)
 
-                if not plan_ok:
+                cycle_links = sorted(cycle_actions.keys())
 
-                    print(">>> ALL path-rank retries failed.")
-                    print(">>> No feasible upgrade plan found for this cycle.")
+                total_cost_cycle, cost_summary, cost_details = compute_upgrade_costs(
+                    safe_links_for_upgrade=cycle_links,
+                    upgrade_decisions=cycle_actions,
+                    algorithm_name=algorithm.name
+                )
 
-                else:
+                equip = float(cost_summary.get("equipment_total", 0.0))
+                work = float(cost_summary.get("workforce_total", 0.0))
+                capex_work_cycle = equip + work
+                total_network_cost += capex_work_cycle
 
-                    print(">>> Upgrade plan accepted.")
-                    print(">>> PlanChecker PASSED")
-
-                    path_stats.clear()
-
-                    safe_links = final_links
-                    upgrade_decisions = final_upgrade_decisions
-                    flat_final_decisions = flatten_upgrade_decisions(upgrade_decisions)
-
-                    # ✅ SAVE PRE-UPGRADE STATE (VERY IMPORTANT)
-                    log_pre_upgrade_per_link_state(
-                        cycle_idx=current_upgrade,
-                        time_day=Current_global_time
-                    )
-
-                    upgrade_decision_history.append({
-                        "cycle": int(current_upgrade),
-                        "time_day": float(Current_global_time),
-                        "blocking_probability": float(metrics.get_blocking_probability()),
-                        "final_decisions": flat_final_decisions,
-                        "cycle_upgrade_level": get_cycle_upgrade_level(flat_final_decisions),
+                day_marker = int(Current_global_time)
+                if not upgrade_cost_timeline or int(upgrade_cost_timeline[-1].get("day", -1)) != day_marker:
+                    upgrade_cost_timeline.append({
+                        "day": float(day_marker),
+                        "equipment": 0.0,
+                        "workforce": 0.0,
+                        "opex": 0.0,
+                        "total": 0.0,
+                        "cumulative_total": float(total_network_cost),
                     })
 
-                    upgrade_cycle_writer.writerow([
-                        int(current_upgrade),
-                        float(Current_global_time),
-                        float(metrics.get_blocking_probability()),
-                        len(safe_links),
-                        str(list(safe_links)),
-                        str(flat_final_decisions),
-                        get_cycle_upgrade_level(flat_final_decisions),
-                    ])
-                    print_upgrade_decisions_summary(Current_global_time, safe_links, upgrade_decisions)
+                row = upgrade_cost_timeline[-1]
+                row["equipment"] = float(row.get("equipment", 0.0)) + equip
+                row["workforce"] = float(row.get("workforce", 0.0)) + work
+                row["total"] = (
+                    float(row.get("equipment", 0.0))
+                    + float(row.get("workforce", 0.0))
+                    + float(row.get("opex", 0.0))
+                )
+                row["cumulative_total"] = float(total_network_cost)
 
-                    # ------------------------------------------------------------
-                    # Build per-link execution plan
-                    #   - Immediate actions are applied globally first
-                    #   - Remaining downtime work is executed link-by-link
-                    # ------------------------------------------------------------
-                    immediate_actions = {}
-                    per_link_jobs = {}
+                if immediate_actions:
+                    immediate_links = sorted(immediate_actions.keys())
+                    for link_id, decs in immediate_actions.items():
+                        for dec in decs:
+                            log_upgrade_action(
+                                upgrade_log_csv,
+                                day=Current_global_time,
+                                period_index=period_index,
+                                scope="immediate",
+                                link_id=link_id,
+                                upgrade_type=dec.get("upgrade_type", ""),
+                                fiber_id=dec.get("fiber_id", None),
+                                core_type=dec.get("core_type", None),
+                            )
 
-                    for lid in safe_links:
-                        decs = upgrade_decisions.get(lid, [])
-
-                        if isinstance(decs, dict):
-                            decs = [decs]
-                        else:
-                            decs = list(decs)
-
-                        has_core = any(d.get("upgrade_type") == "core_upgrade" for d in decs)
-
-                        immediate_actions[lid] = []
-                        per_link_jobs[lid] = []
-
-                        if has_core:
-                            # 🔥 KEEP EVERYTHING TOGETHER
-                            per_link_jobs[lid] = list(decs)
-
-                        else:
-                            for dec in decs:
-                                if dec is None or dec.get("upgrade_type") is None:
-                                    continue
-
-                                utype = dec.get("upgrade_type")
-
-                                if utype == "new_fiber_C":
-                                    immediate_actions[lid].append(dec)
-                                else:
-                                    per_link_jobs[lid].append(dec)
-
-                    immediate_actions = {
-                        lid: decs for lid, decs in immediate_actions.items() if decs
-                    }
-                    per_link_jobs = {
-                        lid: decs for lid, decs in per_link_jobs.items() if decs
-                    }
-
-                    link_execution_queue = [lid for lid in safe_links if lid in per_link_jobs]
-
-                    # ============================================================
-                    # ONE-SHOT COST COMPUTATION FOR THE WHOLE UPGRADE CYCLE
-                    # ============================================================
-                    cycle_actions = {}
-
-                    for lid, decs in immediate_actions.items():
-                        cycle_actions.setdefault(lid, []).extend(decs)
-
-                    for lid, decs in per_link_jobs.items():
-                        cycle_actions.setdefault(lid, []).extend(decs)
-
-                    cycle_links = sorted(cycle_actions.keys())
-
-                    total_cost_cycle, cost_summary, cost_details = compute_upgrade_costs(
-                        safe_links_for_upgrade=cycle_links,
-                        upgrade_decisions=cycle_actions,
-                        algorithm_name=algorithm.name
-                    )
-
-                    equip = float(cost_summary.get("equipment_total", 0.0))
-                    work = float(cost_summary.get("workforce_total", 0.0))
-                    capex_work_cycle = equip + work
-
-                    total_network_cost += capex_work_cycle
-
-                    day_marker = int(Current_global_time)
-                    if not upgrade_cost_timeline or int(upgrade_cost_timeline[-1].get("day", -1)) != day_marker:
-                        upgrade_cost_timeline.append({
-                            "day": float(day_marker),
-                            "equipment": 0.0,
-                            "workforce": 0.0,
-                            "opex": 0.0,
-                            "total": 0.0,
-                            "cumulative_total": float(total_network_cost),
-                        })
-
-                    row = upgrade_cost_timeline[-1]
-                    row["equipment"] = float(row.get("equipment", 0.0)) + equip
-                    row["workforce"] = float(row.get("workforce", 0.0)) + work
-                    row["total"] = (
-                        float(row.get("equipment", 0.0))
-                        + float(row.get("workforce", 0.0))
-                        + float(row.get("opex", 0.0))
-                    )
-                    row["cumulative_total"] = float(total_network_cost)
-
-                    print(
-                        f">>> ONE-SHOT upgrade cycle cost jump applied: "
-                        f"equip={equip:.2f}, workforce={work:.2f}, total={capex_work_cycle:.2f}"
-                    )
-
-                    # ------------------------------------------------------------
-                    # Apply IMMEDIATE upgrades globally (no downtime)
-                    # ------------------------------------------------------------
-                    if immediate_actions:
-                        immediate_links = sorted(immediate_actions.keys())
-                        print(f">>> Immediate (no-downtime) upgrades on links {immediate_links}")
-
-                        for link_id, decs in immediate_actions.items():
-                            for dec in decs:
-                                log_upgrade_action(
-                                    upgrade_log_csv,
-                                    day=Current_global_time,
-                                    period_index=period_index,
-                                    scope="immediate",
-                                    link_id=link_id,
-                                    upgrade_type=dec.get("upgrade_type", ""),
-                                    fiber_id=dec.get("fiber_id", None),
-                                    core_type=dec.get("core_type", None),
-                                )
-
-                        perform_upgrade(
-                            immediate_links,
-                            immediate_actions,
-                            link_status_forward,
-                            link_status_backward,
-                            C_BAND_SLOTS,
-                            TOTAL_SLOTS,
-                            Current_global_time,
-                            algorithm
-                        )
-
-                    # ------------------------------------------------------------
-                    # Start first link's downtime work in PlanChecker order
-                    # ------------------------------------------------------------
-                    (
-                        link_execution_queue,
-                        per_link_jobs,
-                        working_topology,
+                    perform_upgrade(
+                        immediate_links,
+                        immediate_actions,
                         link_status_forward,
                         link_status_backward,
-                        removed_links_info,
-                        ALL_DEMANDS,
-                        total_network_cost,
-                        PATHS,
-                    ) = start_next_link_job(
-                        link_execution_queue=link_execution_queue,
-                        per_link_jobs=per_link_jobs,
-                        current_time=Current_global_time,
-                        period_index=period_index,
-                        working_topology=working_topology,
-                        link_status_forward=link_status_forward,
-                        link_status_backward=link_status_backward,
-                        removed_links_info=removed_links_info,
-                        ALL_DEMANDS=ALL_DEMANDS,
-                        total_network_cost=total_network_cost,
-                        PATHS=PATHS,
+                        C_BAND_SLOTS,
+                        TOTAL_SLOTS,
+                        Current_global_time,
+                        algorithm
                     )
 
-        # ====================================================================
-        # Restore Downtime Links (when downtime expires) + start next job
-        # ====================================================================
+                (
+                    link_execution_queue,
+                    per_link_jobs,
+                    working_topology,
+                    link_status_forward,
+                    link_status_backward,
+                    removed_links_info,
+                    ALL_DEMANDS,
+                    total_network_cost,
+                    PATHS,
+                ) = start_next_link_job(
+                    link_execution_queue=link_execution_queue,
+                    per_link_jobs=per_link_jobs,
+                    current_time=Current_global_time,
+                    period_index=period_index,
+                    working_topology=working_topology,
+                    link_status_forward=link_status_forward,
+                    link_status_backward=link_status_backward,
+                    removed_links_info=removed_links_info,
+                    ALL_DEMANDS=ALL_DEMANDS,
+                    total_network_cost=total_network_cost,
+                    PATHS=PATHS,
+                    upgrade_log_csv=upgrade_log_csv,               
+                    upgrade_cost_timeline=upgrade_cost_timeline,   
+                    algorithm=algorithm,
+                )
 
-        restore_now = [
-            key
-            for key, info in removed_links_info.items()
-            if info.get("restore_time", math.inf) <= Current_global_time
-        ]
+    # Restore Downtime Links
+    restore_now = [
+        key
+        for key, info in removed_links_info.items()
+        if info.get("restore_time", math.inf) <= Current_global_time
+    ]
 
-        if restore_now:
-            print(f">>> Restoring downtime items at day {Current_global_time}")
+    if restore_now:
+        for key in restore_now:
+            info = removed_links_info[key]
+            working_topology, link_status_forward, link_status_backward, removed_links_info = \
+                restore_removed_links_after_downtime(
+                    key=key,
+                    info=info,
+                    current_time=Current_global_time,
+                    link_status_forward=link_status_forward,
+                    link_status_backward=link_status_backward,
+                    current_topology=working_topology,
+                    removed_links_info=removed_links_info
+                )
 
-            for key in restore_now:
-                info = removed_links_info[key]
-                working_topology, link_status_forward, link_status_backward, removed_links_info = \
-                    restore_removed_links_after_downtime(
-                        key=key,
-                        info=info,
-                        current_time=Current_global_time,
-                        link_status_forward=link_status_forward,
-                        link_status_backward=link_status_backward,
-                        current_topology=working_topology,
-                        removed_links_info=removed_links_info
-                    )
+        PATHS = build_k_shortest_paths(working_topology)
+        if not PATHS:
+            raise ValueError("PATHS empty after restoring downtime items.")
 
-            PATHS = build_k_shortest_paths(working_topology)
-            if not PATHS:
-                raise ValueError("PATHS empty after restoring downtime items.")
+        (
+            link_execution_queue,
+            per_link_jobs,
+            working_topology,
+            link_status_forward,
+            link_status_backward,
+            removed_links_info,
+            ALL_DEMANDS,
+            total_network_cost,
+            PATHS,
+        ) = start_next_link_job(
+            link_execution_queue=link_execution_queue,
+            per_link_jobs=per_link_jobs,
+            current_time=Current_global_time,
+            period_index=period_index,
+            working_topology=working_topology,
+            link_status_forward=link_status_forward,
+            link_status_backward=link_status_backward,
+            removed_links_info=removed_links_info,
+            ALL_DEMANDS=ALL_DEMANDS,
+            total_network_cost=total_network_cost,
+            PATHS=PATHS,
+            upgrade_log_csv=upgrade_log_csv,        
+            upgrade_cost_timeline=upgrade_cost_timeline,  
+            algorithm=algorithm,
+        )
 
-            # Start next link's downtime work after all current downtime items restore
-            (
-                link_execution_queue,
-                per_link_jobs,
-                working_topology,
-                link_status_forward,
-                link_status_backward,
-                removed_links_info,
-                ALL_DEMANDS,
-                total_network_cost,
-                PATHS,
-            ) = start_next_link_job(
-                link_execution_queue=link_execution_queue,
-                per_link_jobs=per_link_jobs,
-                current_time=Current_global_time,
-                period_index=period_index,
-                working_topology=working_topology,
-                link_status_forward=link_status_forward,
-                link_status_backward=link_status_backward,
-                removed_links_info=removed_links_info,
-                ALL_DEMANDS=ALL_DEMANDS,
-                total_network_cost=total_network_cost,
-                PATHS=PATHS,
-            )
+    # Remove Expired Connections
+    index_to_remove = []
+    for idy, conn in enumerate(ALL_DEMANDS):
+        if conn.departure_time <= Current_global_time:
+            index_to_remove.append(idy)
 
-        # ====================================================================
-        # Remove Expired Connections
-        # ====================================================================
+    for idy in reversed(index_to_remove):
+        conn = ALL_DEMANDS[idy]
 
-        index_to_remove = []
-        for idy, conn in enumerate(ALL_DEMANDS):
-            if conn.departure_time <= Current_global_time:
-                index_to_remove.append(idy)
+        for i in range(len(conn.path) - 1):
+            src_depart = conn.path[i]
+            dest_depart = conn.path[i + 1]
 
-        for idy in reversed(index_to_remove):
-            conn = ALL_DEMANDS[idy]
+            link = conn.link_ids[i]
+            fiber = conn.fibers_used[i]
+            core = conn.cores_used[i]
 
-            for i in range(len(conn.path) - 1):
-                src_depart = conn.path[i]
-                dest_depart = conn.path[i + 1]
-
-                link = conn.link_ids[i]
-                fiber = conn.fibers_used[i]
-                core = conn.cores_used[i]
-
-                if src_depart < dest_depart:
-                    if link in link_status_forward and fiber in link_status_forward[link]:
-                        fwd_obj = link_status_forward[link][fiber]
-                        if isinstance(fwd_obj, dict) and "slots" in fwd_obj:
+            if src_depart < dest_depart:
+                if link in link_status_forward and fiber in link_status_forward[link]:
+                    fwd_obj = link_status_forward[link][fiber]
+                    if isinstance(fwd_obj, dict) and "slots" in fwd_obj:
+                        for s in range(conn.fs_index, conn.fs_index + conn.slice_window_size):
+                            fwd_obj["slots"][s] = 0
+                    else:
+                        if core in fwd_obj:
                             for s in range(conn.fs_index, conn.fs_index + conn.slice_window_size):
-                                fwd_obj["slots"][s] = 0
-                        else:
-                            if core in fwd_obj:
-                                for s in range(conn.fs_index, conn.fs_index + conn.slice_window_size):
-                                    fwd_obj[core]["slots"][s] = 0
-                else:
-                    if link in link_status_backward and fiber in link_status_backward[link]:
-                        bwd_obj = link_status_backward[link][fiber]
-                        if isinstance(bwd_obj, dict) and "slots" in bwd_obj:
+                                fwd_obj[core]["slots"][s] = 0
+            else:
+                if link in link_status_backward and fiber in link_status_backward[link]:
+                    bwd_obj = link_status_backward[link][fiber]
+                    if isinstance(bwd_obj, dict) and "slots" in bwd_obj:
+                        for s in range(conn.fs_index, conn.fs_index + conn.slice_window_size):
+                            bwd_obj["slots"][s] = 0
+                    else:
+                        if core in bwd_obj:
                             for s in range(conn.fs_index, conn.fs_index + conn.slice_window_size):
-                                bwd_obj["slots"][s] = 0
-                        else:
-                            if core in bwd_obj:
-                                for s in range(conn.fs_index, conn.fs_index + conn.slice_window_size):
-                                    bwd_obj[core]["slots"][s] = 0
+                                bwd_obj[core]["slots"][s] = 0
 
-            del ALL_DEMANDS[idy]
+        del ALL_DEMANDS[idy]
 
-        # ====================================================================
-        # Run RSA for New Connection
-        # ====================================================================
-        mf_index, fs_index, slice_window_size, path, fibers_used, cores_used, link_ids, attempted_paths_info = execute_first_fit(
+    # Run RSA for New Connection
+    mf_index, fs_index, slice_window_size, path, fibers_used, cores_used, link_ids, attempted_paths_info = execute_first_fit(
+        src=src,
+        dest=dest,
+        datarate=datarate,
+        arrival_time=arrival_time,
+        departure_time=departure_time,
+        link_status_forward=link_status_forward,
+        link_status_backward=link_status_backward,
+        topology=working_topology,
+        PATHS=PATHS
+    )
+
+    accepted = (mf_index != float('inf') and fs_index != float('inf'))
+    status = "accepted" if accepted else "blocked"
+
+    connection_log_writer.writerow(
+        build_connection_request_row(
+            connection_id=connection_id,
             src=src,
             dest=dest,
             datarate=datarate,
             arrival_time=arrival_time,
+            holding_time=holding_time,
             departure_time=departure_time,
-            link_status_forward=link_status_forward,
-            link_status_backward=link_status_backward,
-            topology=working_topology,
-            PATHS=PATHS
+            status=status,
+            mf_index=mf_index,
+            fs_index=fs_index,
+            slice_window_size=slice_window_size if accepted else None,
+            path=path if accepted else None,
+            link_ids=link_ids if accepted else None,
+            fibers_used=fibers_used if accepted else None,
+            cores_used=cores_used if accepted else None,
         )
+    )
 
-        accepted = (mf_index != float('inf') and fs_index != float('inf'))
-        status = "accepted" if accepted else "blocked"
+    # Update Path Statistics
+    for info in (attempted_paths_info or []):
+        p_idx = int(info["path_index"])
+        status = info["status"]
 
-        connection_log_writer.writerow(
-            build_connection_request_row(
-                connection_id=connection_id,
-                src=src,
-                dest=dest,
-                datarate=datarate,
-                arrival_time=arrival_time,
-                holding_time=holding_time,
-                departure_time=departure_time,
-                status=status,
-                mf_index=mf_index,
-                fs_index=fs_index,
-                slice_window_size=slice_window_size if accepted else None,
-                path=path if accepted else None,
-                link_ids=link_ids if accepted else None,
-                fibers_used=fibers_used if accepted else None,
-                cores_used=cores_used if accepted else None,
-            )
-        )
-        # ============================================================
-        # UPDATE PATH STATISTICS
-        # ============================================================
+        if status not in ("accepted", "blocked"):
+            continue
 
-        for info in (attempted_paths_info or []):
+        sd_u = sd_key_undirected(src, dest)
+        key = (sd_u[0], sd_u[1], p_idx)
 
-            p_idx = int(info["path_index"])
-            status = info["status"]
+        if key not in path_stats:
+            path_stats[key] = {"path_arrivals": 0, "path_accepted": 0, "path_blocked": 0}
+        path_stats[key]["path_arrivals"] += 1
+        if status == "accepted":
+            path_stats[key]["path_accepted"] += 1
+        else:
+            path_stats[key]["path_blocked"] += 1
 
-            # only count actual spectrum attempts
-            if status not in ("accepted", "blocked"):
-                continue
+        if key not in path_stats_history:
+            path_stats_history[key] = {"path_arrivals": 0, "path_accepted": 0, "path_blocked": 0}
+        path_stats_history[key]["path_arrivals"] += 1
+        if status == "accepted":
+            path_stats_history[key]["path_accepted"] += 1
+        else:
+            path_stats_history[key]["path_blocked"] += 1
 
-            sd_u = sd_key_undirected(src, dest)
-            key = (sd_u[0], sd_u[1], p_idx)
+    if mf_index != float('inf') and fs_index != float('inf'):
+        ALL_DEMANDS.append(ConnectionData(
+            path=path,
+            link_ids=link_ids,
+            fs_index=fs_index,
+            slice_window_size=slice_window_size,
+            mf_index=mf_index,
+            arrival_time=arrival_time,
+            holding_time=holding_time,
+            departure_time=departure_time,
+            datarate=datarate,
+            fibers_used=fibers_used,
+            cores_used=cores_used
+        ))
 
-            # ------------------------------------------------------------
-            # Current-cycle stats (used by link selection)
-            # ------------------------------------------------------------
-            if key not in path_stats:
-                path_stats[key] = {
-                    "path_arrivals": 0,
-                    "path_accepted": 0,
-                    "path_blocked": 0
-                }
+    # Update Metrics
+    if connection_id > config['warmup_connections']:
+        sd_u = sd_key_undirected(src, dest)
+        metrics.sd_arrivals[sd_u] += 1
+        blocked = (mf_index == float('inf') or fs_index == float('inf'))
+        if blocked:
+            metrics.sd_blocked[sd_u] += 1
+        metrics.record_connection(src, dest, datarate, blocked, Current_global_time)
 
-            path_stats[key]["path_arrivals"] += 1
+    # --- 4. PACK UPDATED STATE BACK ---
+    state["Current_global_time"] = Current_global_time
+    state["current_week"] = current_week
+    state["current_upgrade"] = current_upgrade
+    state["current_month"] = current_month
+    state["last_cost_time"] = last_cost_time
+    state["last_logged_day"] = last_logged_day
+    state["total_network_cost"] = total_network_cost
+    state["connection_id"] = connection_id
 
-            if status == "accepted":
-                path_stats[key]["path_accepted"] += 1
-            else:
-                path_stats[key]["path_blocked"] += 1
+    done = bool(metrics.get_blocking_probability() >= config['blocking_threshold'])
+    reward = -float(metrics.get_blocking_probability())
 
-            # ------------------------------------------------------------
-            # Full-history stats (kept until end of simulation)
-            # ------------------------------------------------------------
-            if key not in path_stats_history:
-                path_stats_history[key] = {
-                    "path_arrivals": 0,
-                    "path_accepted": 0,
-                    "path_blocked": 0
-                }
+    return state, reward, done
 
-            path_stats_history[key]["path_arrivals"] += 1
+def run_simulation(config: Dict[str, Any]):
+    """
+    Run the optical network simulation with given configuration using the modular loop.
+    """
+    # 1. Initialize simulation state
+    state = initialize_simulation_state(config)
+    done = False
 
-            if status == "accepted":
-                path_stats_history[key]["path_accepted"] += 1
-            else:
-                path_stats_history[key]["path_blocked"] += 1
+    # 2. Main Event Loop
+    while not done:
+        state, reward, done = run_single_cycle(state)
 
-        if mf_index != float('inf') and fs_index != float('inf'):
-            ALL_DEMANDS.append(ConnectionData(
-                path=path,
-                link_ids=link_ids,
-                fs_index=fs_index,
-                slice_window_size=slice_window_size,
-                mf_index=mf_index,
-                arrival_time=arrival_time,
-                holding_time=holding_time,
-                departure_time=departure_time,
-                datarate=datarate,
-                fibers_used=fibers_used,
-                cores_used=cores_used
-            ))
+    # 3. Post-Simulation Results, Plots, and Reporting
+    metrics = state["metrics"]
+    analysis = state["analysis"]
+    Current_global_time = state["Current_global_time"]
+    total_network_cost = state["total_network_cost"]
+    upgrade_cost_timeline = state["upgrade_cost_timeline"]
+    upgrade_decision_history = state["upgrade_decision_history"]
+    budget_params = state["budget_params"]
+    path_stats_history = state["path_stats_history"]
+    start_wall_time = state["start_wall_time"]
 
-        # ====================================================================
-        # Update Metrics (after warmup)
-        # ====================================================================
-
-        if connection_id > config['warmup_connections']:
-            sd_u = sd_key_undirected(src, dest)
-            metrics.sd_arrivals[sd_u] += 1
-
-            blocked = (mf_index == float('inf') or fs_index == float('inf'))
-            if blocked:
-                metrics.sd_blocked[sd_u] += 1
-
-            metrics.record_connection(src, dest, datarate, blocked, Current_global_time)
-
-            if metrics.get_blocking_probability() >= config['blocking_threshold']:
-                print(
-                    f"\nSimulation stopped: blocking threshold "
-                    f"({config['blocking_threshold']}) reached at day {Current_global_time:.1f}."
-                )
-                break
-
-    # ========================================================================
-    # Generate Results
-    # ========================================================================
-
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("SIMULATION COMPLETE")
-    print("="*70)
+    print("=" * 70)
 
     analysis.save_blocking_data(
         metrics.time_points,
@@ -1724,12 +1526,11 @@ def run_simulation(config: Dict[str, Any]):
 
     end_wall_time = time.time()
     total_runtime_sec = end_wall_time - start_wall_time
-    account_running_opex_until(Current_global_time)
 
     snapshot = {
-        "seed": seed,
+        "seed": state["seed"],
         "Current_global_time": Current_global_time,
-        "connection_id": connection_id,
+        "connection_id": state["connection_id"],
         "connection_count": metrics.connection_count,
         "blocked_connection_count": metrics.blocked_connection_count,
         "arrived_datarate": metrics.arrived_datarate,
@@ -1737,19 +1538,17 @@ def run_simulation(config: Dict[str, Any]):
         "blocked_datarate": metrics.blocked_datarate,
         "time_points": metrics.time_points,
         "blocking_prob_points": metrics.blocking_prob_points,
-        "traffic_rates": traffic_rates,
+        "traffic_rates": state["traffic_rates"],
         "total_network_cost": total_network_cost,
         "upgrade_cost_timeline": upgrade_cost_timeline,
         "upgrade_decision_history": upgrade_decision_history,
-        "link_status_forward": link_status_forward,
-        "link_status_backward": link_status_backward,
-        "ALL_DEMANDS": ALL_DEMANDS,
-        "working_topology": working_topology,
+        "link_status_forward": state["link_status_forward"],
+        "link_status_backward": state["link_status_backward"],
+        "ALL_DEMANDS": state["ALL_DEMANDS"],
+        "working_topology": state["working_topology"],
         "wall_clock_runtime_seconds": total_runtime_sec,
         "budget_params": budget_params,
         "path_stats_history": path_stats_history,
-        "daily_network_technology_csv": str(daily_network_csv),
-        "upgrade_cycle_summary_csv": str(upgrade_cycle_csv),
     }
     analysis.save_snapshot(snapshot, config['snapshot_file'])
     save_path_stats_history_csv(path_stats_history, config['results_dir'])
@@ -1769,10 +1568,8 @@ def run_simulation(config: Dict[str, Any]):
 
     generate_blocking_vs_upgrade_plot(config, metrics, upgrade_decision_history)
 
-    # ✅ ADD THIS BLOCK HERE
     try:
         from sim.modules.simulation_analysis import plot_technology_mix_by_upgrade_index
-
         plot_technology_mix_by_upgrade_index(
             folder=config["results_dir"],
             outdir=config["results_dir"],
@@ -1780,27 +1577,13 @@ def run_simulation(config: Dict[str, Any]):
         )
     except Exception as e:
         print(f"[WARN] Technology mix plot failed: {e}")
-    connection_log_file.close()
 
-    # ✅ ADD THESE
-    daily_network_file.close()
-    upgrade_cycle_file.close()
-    pre_upgrade_per_link_file.close()
+    state["connection_log_file"].close()
+    state["daily_network_file"].close()
+    state["upgrade_cycle_file"].close()
+    state["pre_upgrade_per_link_file"].close()
+
     print(f"\n✓ All results saved to: {config['results_dir']}")
-
-    end_wall_time = time.time()
-    total_runtime_sec = end_wall_time - start_wall_time
-    total_runtime_min = total_runtime_sec / 60.0
-    total_runtime_hr = total_runtime_min / 60.0
-
-    print("\n" + "-"*60)
-    print(f"Total wall-clock runtime:")
-    print(f"  {total_runtime_sec:.2f} seconds")
-    print(f"  {total_runtime_min:.2f} minutes")
-    print(f"  {total_runtime_hr:.2f} hours")
-    print("-"*60)
-
-    snapshot["wall_clock_runtime_seconds"] = total_runtime_sec
 
 
 # ============================================================================
@@ -2234,10 +2017,6 @@ def save_path_stats_history_csv(path_stats_history: dict, results_dir: Path):
 
     print(f"✓ Saved full path statistics to {out_file}")
 
-
-# ============================================================================
-# Entry Point
-# ============================================================================
 
 # ============================================================================
 # Entry Point
