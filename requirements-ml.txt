@@ -1,0 +1,10 @@
+# Extra packages for the ML parts (XGBoost gatekeeper + DRL agent).
+# Not needed for heuristic runs (ml_mode = 'off').
+#   pip install -r requirements.txt -r requirements-ml.txt
+pandas
+scikit-learn
+xgboost>=2.0
+gymnasium>=0.29
+torch
+stable-baselines3>=2.3
+sb3-contrib>=2.3

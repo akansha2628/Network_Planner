@@ -5,6 +5,107 @@ A modular optical network simulator with network upgrade planning capabilities.
 Configure simulation parameters in the CONFIG dictionary below.
 """
 
+# ##############################################################################
+# ##############################################################################
+# ###                                                                        ###
+# ###   ML-INTEGRATION CHANGE LOG — main.py (changes made by Claude)          ###
+# ###                                                                        ###
+# ###   Every change below is marked in the code with a box that starts      ###
+# ###       ### ML-INTEGRATION CHANGE M<number> (Claude) ###                 ###
+# ###   Search for "ML-INTEGRATION CHANGE" to jump between them. Anything    ###
+# ###   WITHOUT such a box is your/Akansha's original code, unchanged.       ###
+# ###   The commented-out legacy simulator at the bottom is untouched.       ###
+# ###   plan_checker.py was NOT changed.                                     ###
+# ###                                                                        ###
+# ##############################################################################
+# ##############################################################################
+#
+#  M1  Removed the top-level `import xgboost as xgb`. xgboost/sb3_contrib are now
+#      imported only inside the ML loaders, so heuristic runs don't need them.
+#  M2  Feature extraction = single source of truth (top of file):
+#      - classify_fiber_state() moved here from inside run_single_cycle()
+#      - new build_feature_row(): RAW features (what XGBoost was trained on)
+#      - all flatten_*() helpers take an optional fixed link_ids list so the
+#        vector is always 313 long, even while a link is down
+#      - extract_313_features_standalone(): classifier arg now optional,
+#        traffic-slice size computed from N instead of hard-coded 133
+#  M3  CONFIG: added 'seed' (single-seed mode crashed without it) and the ML keys:
+#      ml_mode ('off'|'train'|'deploy'), ml_base_algorithm, ml_fallback_algorithm,
+#      ml_gatekeeper_path, ml_drl_policy_path, ml_gatekeeper_threshold,
+#      ml_train_gatekeeper. ml_mode='off' = original heuristic behaviour.
+#  M4  NEW block of ML helper functions (gatekeeper/DRL loading, gatekeeper
+#      prediction, candidate links, O(1) action mask, DRL observation,
+#      apply_drl_decision with the incremental fallback, commit_upgrade_plan,
+#      run_heuristic_upgrade, ...).
+#      commit_upgrade_plan() and run_heuristic_upgrade() are Akansha's original
+#      code moved out of run_single_cycle() unchanged, so heuristics and ML share
+#      exactly the same plan_checker/commit/physics path.
+#  M5  initialize_simulation(): in ML modes loads ml_base_algorithm and writes
+#      results to results/ml_<mode>_<topology>.
+#  M6  initialize_simulation_state(): loads the gatekeeper, fixes the link order,
+#      adds DRL bookkeeping keys to the state dict.
+#  M7  run_single_cycle(): guard so it can't advance while a DRL decision is pending.
+#  M8  run_single_cycle(): removed the nested classify_fiber_state /
+#      log_pre_upgrade_per_link_state (now top level); added _sync_to_state /
+#      _sync_from_state helpers.
+#  M9  run_single_cycle() upgrade cycle:
+#      - ml_mode='off': unchanged logic (now via run_heuristic_upgrade +
+#        commit_upgrade_plan)
+#      - ML modes: XGBoost gatekeeper decides IF; main.py's own link selection
+#        gives the candidate links; a DRL decision point is created.
+#  M10 BUG FIX: run_single_cycle() now writes ALL reassigned locals back into
+#      state (the downtime job queue, per-link jobs, PATHS after restore,
+#      topology, link status were being lost). Stop rule only checked after
+#      warmup, as in the original single-loop simulator.
+#  M11 run_simulation(): BUG FIX uses the extended config from state (was
+#      KeyError 'blocking_csv' at the end of every run); deploy-mode loop
+#      (gatekeeper -> DRL -> plan_checker -> fallback to incremental on FAIL).
+#  M12 run_simulation(): saves drl_decisions.csv, closes files, returns state.
+#  M13 __main__: log/results folder uses get_run_label() (ml_deploy etc.).
+#  M14 MULTI-LINK DRL SELECTION: each cycle the DRL keeps picking candidate links
+#      (one pick at a time) until no remaining candidate fits the remaining
+#      CAPEX/TOTAL budget or the sequential-downtime limit; then the WHOLE set goes
+#      to plan_checker once. (STOP rules were later changed by M16 - budget
+#      saving within the year.) DRL observation = the
+#      313 features + per-link "already picked" flags + remaining CAPEX/downtime.
+#  M15 DRL CHOOSES THE UPGRADE LEVEL: each action is (link, level). Levels can
+#      be Akansha's per-link rules (CONFIG['ml_upgrade_levels'] = a list such as
+#      ['increment', 'greedy', 'jump_to_max']; levels that give the same upgrade
+#      as a lower level are masked out). Default is now 'any_higher' (M17).
+#      The per-link observation value encodes the level picked.
+#  M16 BUDGET SAVING: the DRL may stop early or skip a cycle to keep money for a
+#      later cycle of the same budget year (no incremental fallback overrides a
+#      deliberate save). In the year's LAST cycle it must spend what fits.
+#      Observation gains a "last cycle of the year" flag (336 values on dt12).
+#      Optional: CONFIG['ml_year_end_override_gatekeeper'] lets the year's last
+#      cycle reach the DRL even if the gatekeeper says no.
+#  M17 ANY HIGHER UPGRADE: default upgrade choice is now 'any_higher': per link
+#      the DRL picks any target technology state with more capacity than now
+#      (18 targets; several upgrade steps on one link in one cycle allowed;
+#      361 actions on dt12). Year-end gatekeeper override is ON by default, and
+#      in that cycle the DRL decides whether to spend (it is not forced).
+#  M18 Model files are also looked up in sim/ml/ (where gatekeeper.py and
+#      DRL_code.py live in the repository and save their models).
+#  M19 Optional CONFIG['ml_run_tag'] gives each parallel simulator (DRL training
+#      with --n-envs, or --evaluate) its own results folder.
+#  M20 BUG FIX: DRL input scaling. Every feature is now divided by its real
+#      maximum (links with more than 1,000 slots used to all look the same, and
+#      fiber counts were nearly invisible); traffic is on a log scale. XGBoost
+#      input is unchanged (raw features).
+#
+#  Decision flow in ML modes:
+#    XGBoost: upgrade needed? --no--> nothing this cycle
+#        | yes
+#    main.py link selection (select_links_for_upgrade + network_connectivity,
+#    path ranks 0-2) -> candidate links -> DRL picks (link, upgrade level) one by
+#    one until nothing else fits budget/downtime -> whole set goes to
+#        -> plan_checker (budget, sequential downtime, projected BBP)
+#             PASS -> commit
+#             FAIL -> nothing spent, DRL penalised (training), cycle falls back
+#                     to the incremental heuristic
+# ##############################################################################
+
+
 import sys
 import random
 from math import floor
@@ -20,7 +121,244 @@ from pathlib import Path
 from typing import Dict, Tuple, Any, Optional
 import time
 from collections import defaultdict
-import xgboost as xgb
+
+##############################################################################
+# ### ML-INTEGRATION CHANGE M1 (Claude) ###
+# REMOVED here: `import xgboost as xgb` (was line 23 of your file).
+# Now imported lazily in load_gatekeeper()/load_drl_policy() (block M4).
+##############################################################################
+# NOTE: xgboost / sb3_contrib are imported lazily inside the ML helpers below,
+# so heuristic runs (ml_mode = "off") do not require the ML packages.
+
+
+##############################################################################
+# ### ML-INTEGRATION CHANGE M2 (Claude) ###
+# This whole feature-extraction section replaces your previous helper block.
+# - classify_fiber_state(): MOVED here unchanged from inside run_single_cycle()
+#   (DRL_code.py's old fallback version returned 'SC_C' for every fiber).
+# - _iter_links() + optional link_ids param on every flatten_*(): fixed
+#   link order/length, missing (downed) links are filled with zeros.
+# - build_feature_row(): NEW, raw features for the XGBoost gatekeeper.
+# - extract_313_features_standalone(): classify fn now optional; traffic
+#   slice uses N*(N-1) instead of a hard-coded 1:133. Same normalization.
+##############################################################################
+# ============================================================================
+# ML FEATURE EXTRACTION — SINGLE SOURCE OF TRUTH
+# ----------------------------------------------------------------------------
+# Every consumer (XGBoost data logging, XGBoost gatekeeper at deploy time,
+# DRL training env, DRL deploy policy) builds features through these
+# top-level functions so the feature vector is identical everywhere.
+#
+#   build_feature_row(...)              -> raw feature dict (XGBoost input)
+#   extract_313_features_standalone(...) -> (raw dict, normalized vector) (DRL input)
+#
+# Feature layout (dt12: N=12 nodes, 20 links -> 1 + 132 + 4*20 + 5*20 = 313):
+#   current_BBP
+#   lambda_i_j                   for every ordered node pair i != j
+#   link_<id>_{SC_C,SC_CL,MC_C,MC_CL}
+#   link_<id>_{occupied_slots,total_slots,free_slots,slot_utilization,max_contiguous_free_slots}
+# ============================================================================
+
+def classify_fiber_state(fiber_obj):
+    """
+    Classify one fiber object as SC_C / SC_CL / MC_C / MC_CL (or None if dark/unknown).
+    Moved to top level (was nested inside run_single_cycle) so DRL_code.py and the
+    XGBoost logger can import the exact same classifier.
+    """
+    if not isinstance(fiber_obj, dict):
+        return None
+
+    if "lit" in fiber_obj and "bands" in fiber_obj:
+        if not fiber_obj.get("lit", False):
+            return None
+        bands = set(fiber_obj.get("bands", []))
+        if bands == {"C"}:
+            return "SC_C"
+        elif bands == {"C", "L"}:
+            return "SC_CL"
+        return None
+
+    core_keys = [k for k in fiber_obj.keys() if isinstance(k, int)]
+    if core_keys:
+        lit_cores = []
+        all_bands = set()
+        for ck in core_keys:
+            core = fiber_obj.get(ck, {})
+            if isinstance(core, dict) and core.get("lit", False):
+                lit_cores.append(ck)
+                all_bands.update(core.get("bands", []))
+        if not lit_cores:
+            return None
+        return "MC_CL" if "L" in all_bands else "MC_C"
+    return None
+
+
+def _iter_links(link_status_forward, link_ids=None):
+    """
+    Yield (link_id, fibers) in a FIXED order.
+    If link_ids is given, every id is yielded even if the link is temporarily
+    missing from link_status_forward (e.g. during downtime) -> fixed-length vector.
+    """
+    if link_ids is None:
+        for link_id, fibers in sorted(link_status_forward.items()):
+            yield link_id, fibers
+    else:
+        for link_id in link_ids:
+            yield link_id, link_status_forward.get(link_id, {})
+
+
+def flatten_traffic_matrix(traffic_rates):
+    row = {}
+    n = traffic_rates.shape[0]
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            row[f"lambda_{i}_{j}"] = float(traffic_rates[i][j])
+    return row
+
+
+def flatten_link_technology_state(link_status_forward, classify_fiber_state_fn=None, link_ids=None):
+    if classify_fiber_state_fn is None:
+        classify_fiber_state_fn = classify_fiber_state
+    row = {}
+    for link_id, fibers in _iter_links(link_status_forward, link_ids):
+        sc_c = sc_cl = mc_c = mc_cl = 0
+        for _, fiber_obj in fibers.items():
+            state = classify_fiber_state_fn(fiber_obj)
+            if state == "SC_C": sc_c += 1
+            elif state == "SC_CL": sc_cl += 1
+            elif state == "MC_C": mc_c += 3
+            elif state == "MC_CL": mc_cl += 3
+
+        row[f"link_{link_id}_SC_C"] = sc_c
+        row[f"link_{link_id}_SC_CL"] = sc_cl
+        row[f"link_{link_id}_MC_C"] = mc_c
+        row[f"link_{link_id}_MC_CL"] = mc_cl
+    return row
+
+
+def max_contiguous_free_slots(slots):
+    max_run = current_run = 0
+    for value in slots:
+        if value == 0:
+            current_run += 1
+            max_run = max(max_run, current_run)
+        else:
+            current_run = 0
+    return max_run
+
+
+def summarize_slot_array(slots):
+    if slots is None:
+        return {"occupied_slots": 0, "total_slots": 0, "free_slots": 0, "max_contiguous_free_slots": 0}
+    total_slots = len(slots)
+    occupied_slots = sum(1 for value in slots if value != 0)
+    free_slots = total_slots - occupied_slots
+    max_free_block = max_contiguous_free_slots(slots)
+    return {
+        "occupied_slots": occupied_slots,
+        "total_slots": total_slots,
+        "free_slots": free_slots,
+        "max_contiguous_free_slots": max_free_block,
+    }
+
+
+def flatten_link_slot_occupancy_state(link_status_forward, link_ids=None):
+    row = {}
+    for link_id, fibers in _iter_links(link_status_forward, link_ids):
+        occupied_slots = total_slots = free_slots = max_free_block = 0
+        for _, fiber_obj in fibers.items():
+            if not isinstance(fiber_obj, dict):
+                continue
+            if "lit" in fiber_obj and "slots" in fiber_obj:
+                if not fiber_obj.get("lit", False):
+                    continue
+                summary = summarize_slot_array(fiber_obj.get("slots", []))
+                occupied_slots += summary["occupied_slots"]
+                total_slots += summary["total_slots"]
+                free_slots += summary["free_slots"]
+                max_free_block = max(max_free_block, summary["max_contiguous_free_slots"])
+            else:
+                core_keys = [k for k in fiber_obj.keys() if isinstance(k, int)]
+                for core_id in core_keys:
+                    core_obj = fiber_obj.get(core_id, {})
+                    if not isinstance(core_obj, dict) or not core_obj.get("lit", False):
+                        continue
+                    summary = summarize_slot_array(core_obj.get("slots", []))
+                    occupied_slots += summary["occupied_slots"]
+                    total_slots += summary["total_slots"]
+                    free_slots += summary["free_slots"]
+                    max_free_block = max(max_free_block, summary["max_contiguous_free_slots"])
+
+        slot_utilization = (occupied_slots / total_slots) if total_slots > 0 else 0.0
+        row[f"link_{link_id}_occupied_slots"] = occupied_slots
+        row[f"link_{link_id}_total_slots"] = total_slots
+        row[f"link_{link_id}_free_slots"] = free_slots
+        row[f"link_{link_id}_slot_utilization"] = slot_utilization
+        row[f"link_{link_id}_max_contiguous_free_slots"] = max_free_block
+    return row
+
+
+def build_feature_row(current_bbp, traffic_rates, link_status_forward,
+                      classify_fiber_state_fn=None, link_ids=None):
+    """Raw (un-normalized) feature dict. This is what XGBoost was trained on."""
+    row = {"current_BBP": float(current_bbp)}
+    row.update(flatten_traffic_matrix(traffic_rates))
+    row.update(flatten_link_technology_state(link_status_forward, classify_fiber_state_fn, link_ids))
+    row.update(flatten_link_slot_occupancy_state(link_status_forward, link_ids))
+    return row
+
+
+def extract_313_features_standalone(current_bbp, traffic_rates, link_status_forward,
+                                    classify_fiber_state_fn=None, link_ids=None):
+    """
+    Returns (raw_row_dict, normalized_vector) for the DRL agent.
+    The normalized vector is ONLY for the DRL policy; XGBoost must get the raw row.
+    """
+    row = build_feature_row(current_bbp, traffic_rates, link_status_forward,
+                            classify_fiber_state_fn, link_ids)
+
+    ##############################################################################
+    # ### ML-INTEGRATION CHANGE M20 (Claude) ###
+    # BUG FIX (DRL input scaling). Was: every lambda and every per-link value
+    # divided by 1000 and clipped at 1.0. A fully upgraded link has 8,640 slots,
+    # so all links with more than 1,000 slots looked identical to the DRL (29% of
+    # the total_slots values in combined_dataset.csv), and the fiber counts
+    # (at most 3 or 9) became ~0.001-0.009, i.e. almost invisible.
+    # Now each feature is divided by its real maximum (from sim/core/constants),
+    # and traffic, which grows ~200x over a lifetime, is on a log scale.
+    # Only the DRL vector changes; XGBoost still gets the raw row.
+    ##############################################################################
+    raw_vector = np.array(list(row.values()), dtype=np.float32)
+    max_slots = float(FIBERS * Num_cores * TOTAL_SLOTS)        # 8,640: all fibers multi-core C+L
+    per_link_max = {
+        "_SC_C": float(FIBERS), "_SC_CL": float(FIBERS),
+        "_MC_C": float(FIBERS * Num_cores), "_MC_CL": float(FIBERS * Num_cores),
+        "_occupied_slots": max_slots, "_total_slots": max_slots, "_free_slots": max_slots,
+        "_slot_utilization": 1.0, "_max_contiguous_free_slots": float(TOTAL_SLOTS),
+    }
+    normalized_vector = np.zeros_like(raw_vector, dtype=np.float32)
+    for i, (name, value) in enumerate(row.items()):
+        value = float(value)
+        if name == "current_BBP":
+            normalized_vector[i] = value / DRL_BBP_SCALE
+        elif name.startswith("lambda_"):
+            normalized_vector[i] = ((math.log1p(max(value, 0.0)) - math.log1p(DRL_LAMBDA_LOG_MIN))
+                                    / (math.log1p(DRL_LAMBDA_LOG_MAX) - math.log1p(DRL_LAMBDA_LOG_MIN)))
+        else:
+            # longest suffix first: "_max_contiguous_free_slots" also ends in "_free_slots"
+            suffix = max((sfx for sfx in per_link_max if name.endswith(sfx)), key=len)
+            normalized_vector[i] = value / per_link_max[suffix]
+    normalized_vector = np.clip(normalized_vector, 0.0, 1.0).astype(np.float32)
+    return row, normalized_vector
+
+
+# M20: DRL input scales. BBP up to the 0.1 lifetime threshold; traffic on a log scale
+# from 10 to 20,000 (her datasets: 23 at the start, 4,582 at the end of a lifetime).
+DRL_BBP_SCALE = 0.1
+DRL_LAMBDA_LOG_MIN = 10.0
+DRL_LAMBDA_LOG_MAX = 20000.0
 
 
 # ============================================================================
@@ -31,8 +369,13 @@ CONFIG = {
     # Topology: 'test5' (5-node test network) or 'dt12' (12-node production network)
     'topology': 'dt12',
 
-    # Algorithm: 'greedy', 'increment', 'max_initial', 'jump_to_max', 'no_upgrade'
-    'algorithm': 'greedy',  # or 'max_initial' or 'jump_to_max'
+    ##############################################################################
+    # ### ML-INTEGRATION CHANGE M3 (Claude) ###
+    # Comment only: added 'random' to the list and noted it is used when ml_mode='off'.
+    ##############################################################################
+    # Algorithm: 'greedy', 'increment', 'max_initial', 'jump_to_max', 'no_upgrade', 'random'
+    # (used when ml_mode = 'off')
+    'algorithm': 'greedy',
 
     # Link selection mode:
     # "path_congestion" -> current logic
@@ -44,6 +387,11 @@ CONFIG = {
     'link_score_threshold': 0.02,
 
     # ---------------- Multi-seed running ----------------
+    ##############################################################################
+    # ### ML-INTEGRATION CHANGE M3 (Claude) ###
+    # ADDED 'seed': the single-seed branch in __main__ reads CONFIG['seed'].
+    ##############################################################################
+    'seed': 0,                     # used when run_multiple_seeds = False
     'run_multiple_seeds': True,
     'seed_start': 0,
     'seed_end': 0,
@@ -57,10 +405,70 @@ CONFIG = {
     # 'budget_selection_mode': 'budget_unaware',
 
     # ---------------- ML/XGBoost data collection ----------------
+    ##############################################################################
+    # ### ML-INTEGRATION CHANGE M3 (Claude) ###
+    # Comment only. In ML modes, data collection is switched off automatically (M6).
+    ##############################################################################
+    # (only active when ml_mode = 'off'; labels come from the heuristic's check_need_for_upgrade)
     'collect_xgboost_data': True,
     'xgboost_csv_name': 'xgboost_need_upgrade_dataset.csv',
     'reset_xgboost_csv_before_run': True,
 
+    ##############################################################################
+    # ### ML-INTEGRATION CHANGE M3 (Claude) ###
+    # ADDED: all ML configuration keys below. ml_mode='off' keeps the original behaviour.
+    ##############################################################################
+    # ---------------- ML pipeline ----------------
+    # 'off'    -> Akansha's heuristic in CONFIG['algorithm'] (unchanged behaviour)
+    # 'train'  -> backend physics engine for DRL_code.py (do not run main.py directly in this mode)
+    # 'deploy' -> XGBoost gatekeeper decides IF, DRL policy decides WHICH link, plan_checker validates
+    'ml_mode': 'off',
+
+    # Heuristic whose per-link upgrade rule supplies the upgrade TYPE for the link the DRL
+    # agent picks, and whose algorithm object plan_checker uses for escalation/cost naming.
+    'ml_base_algorithm': 'increment',
+
+    # Heuristic run for the cycle when the DRL's proposal fails plan_checker
+    # (or the DRL passes while a feasible candidate existed).
+    'ml_fallback_algorithm': 'increment',
+
+    ##############################################################################
+    # ### ML-INTEGRATION CHANGE M16 (Claude) ###
+    # BUDGET SAVING: the DRL may stop picking early, or skip a cycle entirely, to
+    # keep money for a LATER cycle of the SAME budget year (budgets do not carry
+    # over to the next year). In the LAST cycle of a budget year it must keep
+    # picking while anything still fits, so leftover money is used, not wasted.
+    ##############################################################################
+    'ml_allow_early_stop': True,               # DRL may save budget within the year
+    'ml_spend_all_last_cycle_of_year': True,   # ...but must spend what fits in the year's last cycle
+    # If True, the year's last cycle becomes a DRL decision point even when the
+    # gatekeeper says "no upgrade", as long as budget is left (use it or lose it).
+    # False = the gatekeeper's "no" always skips the cycle.
+    'ml_year_end_override_gatekeeper': True,
+    # In such an override cycle: False = the DRL DECIDES whether to spend (it may skip);
+    # True = it must spend whatever fits.
+    'ml_year_end_override_forces_spend': False,
+
+    ##############################################################################
+    # ### ML-INTEGRATION CHANGE M15 (Claude) ###
+    # ADDED: upgrade levels the DRL can choose from for each link.
+    ##############################################################################
+    # 'any_higher' (M17, default): the DRL picks any higher target technology state per
+    #     link (18 targets -> 20 links x 18 + STOP = 361 actions on dt12).
+    # A list of rule names instead, e.g. ['increment', 'greedy', 'jump_to_max'], uses
+    #     her per-link rules as the options (M15); ['increment'] = links-only.
+    'ml_upgrade_levels': 'any_higher',
+
+    # Model files (relative paths are looked up in: current folder, next to main.py, sim/ml/)
+    'ml_gatekeeper_path': 'xgboost_gatekeeper_model.json',
+    'ml_drl_policy_path': 'drl_optical_policy.zip',
+    'ml_gatekeeper_threshold': 0.5,
+
+    # Who decides IF an upgrade is needed while TRAINING the DRL agent:
+    # 'auto'    -> XGBoost gatekeeper if its JSON exists, otherwise 'always'
+    # 'xgboost' -> XGBoost gatekeeper (error if JSON missing)
+    # 'always'  -> every upgrade cycle is a decision point (agent can still pass)
+    'ml_train_gatekeeper': 'auto',
 
     # # Allowed daily OPEX budget = factor × initial daily OPEX
     # 'opex_budget_factor': 3,
@@ -129,6 +537,1035 @@ from sim.upgrade.upgrade_logging import init_upgrade_log, log_upgrade_action
 from sim.upgrade.cost_model import compute_upgrade_costs
 
 
+##############################################################################
+# ### ML-INTEGRATION CHANGE M4 (Claude) ###
+# ENTIRE BLOCK IS NEW, down to the 'M4 — END' box. Contents:
+# - get_ml_mode / get_run_label / resolve_model_path
+# - load_gatekeeper / load_drl_policy / gatekeeper_for_mode (cached loaders)
+# - gatekeeper_predict: XGBoost on RAW features, columns matched by name
+# - heuristic_safe_links / run_heuristic_upgrade: your heuristic link selection
+#   + plan_checker loop, moved here unchanged (used by 'off' AND by the fallback)
+# - drl_candidate_links: candidates = union of safe links for path ranks 0-2
+# - get_fallback_algorithm: 'increment' by default
+# - build_link_upgrade_proposal: DRL link -> fully formed decision dicts
+#   (upgrade type + fiber_id from the base algorithm's rule)
+# - remaining_budget_snapshot / _selected_decisions / selection_usage /
+#   compute_drl_action_mask / drl_observation: O(1) multi-pick mask (M14)
+# - commit_upgrade_plan: your 'if plan_ok:' block moved here unchanged
+# - apply_drl_decision / _finalize_drl_cycle: DRL picks links one by one; the
+#   whole set -> plan_checker -> commit, or FAIL -> incremental (M14)
+# - drl_policy_action (deploy inference), close_state_files
+##############################################################################
+# ============================================================================
+# ML PIPELINE HELPERS (XGBoost gatekeeper + DRL link selection)
+# ============================================================================
+
+ML_MODES = ("off", "train", "deploy")
+_ML_MODEL_CACHE: Dict[str, Any] = {}
+
+
+def get_ml_mode(config: Dict[str, Any]) -> str:
+    mode = str(config.get("ml_mode", "off")).lower()
+    if mode not in ML_MODES:
+        raise ValueError(f"CONFIG['ml_mode'] must be one of {ML_MODES}, got {mode!r}")
+    return mode
+
+
+def get_run_label(config: Dict[str, Any]) -> str:
+    """Results-folder label: heuristic name, or ml_train / ml_deploy.
+    M19: an optional CONFIG['ml_run_tag'] is appended so parallel training / evaluation
+    simulators each write to their own results folder instead of overwriting each other."""
+    mode = get_ml_mode(config)
+    label = config["algorithm"] if mode == "off" else f"ml_{mode}"
+    tag = config.get("ml_run_tag")
+    return f"{label}_{tag}" if tag else label
+
+
+##############################################################################
+# ### ML-INTEGRATION CHANGE M18 (Claude) ###
+# FIX for the repository layout: gatekeeper.py and DRL_code.py live in sim/ml/
+# and save their models there, while main.py is at the top level. Model files
+# are now looked up in: the current folder, next to main.py, and sim/ml/.
+##############################################################################
+def resolve_model_path(path_like) -> Path:
+    """
+    Absolute path -> as is. Relative path -> first existing of:
+      1) current working directory, 2) next to main.py, 3) <main.py folder>/sim/ml/
+    If none exists, returns the sim/ml/ location (where the training scripts save).
+    """
+    p = Path(path_like)
+    if p.is_absolute():
+        return p
+    main_dir = Path(__file__).resolve().parent
+    candidates = [Path.cwd() / p, main_dir / p, main_dir / "sim" / "ml" / p]
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[-1]
+
+
+def load_gatekeeper(path_like):
+    """Load (and cache) the XGBoost gatekeeper saved by gatekeeper.py."""
+    path = resolve_model_path(path_like)
+    key = f"xgb::{path}"
+    if key in _ML_MODEL_CACHE:
+        return _ML_MODEL_CACHE[key]
+    if not path.exists():
+        raise FileNotFoundError(
+            f"XGBoost gatekeeper model not found (looked in the current folder, next to "
+            f"main.py, and in sim/ml/). Run sim/ml/gatekeeper.py first (it writes "
+            f"xgboost_gatekeeper_model.json next to itself), or point "
+            f"CONFIG['ml_gatekeeper_path'] at the file."
+        )
+    import xgboost as xgb
+    model = xgb.XGBClassifier()
+    model.load_model(str(path))
+    feature_names = model.get_booster().feature_names
+    if not feature_names:
+        raise ValueError(
+            f"{path} has no stored feature names. Re-train with gatekeeper.py "
+            f"(it trains on a pandas DataFrame, which stores them)."
+        )
+    _ML_MODEL_CACHE[key] = model
+    print(f"✓ Loaded XGBoost gatekeeper: {path} ({len(feature_names)} features)")
+    return model
+
+
+def load_drl_policy(path_like):
+    """Load (and cache) the MaskablePPO policy saved by DRL_code.py."""
+    path = resolve_model_path(path_like)
+    key = f"drl::{path}"
+    if key in _ML_MODEL_CACHE:
+        return _ML_MODEL_CACHE[key]
+    if not path.exists():
+        raise FileNotFoundError(
+            f"DRL policy not found (looked in the current folder, next to main.py, and in "
+            f"sim/ml/). Train it with sim/ml/DRL_code.py first, or point "
+            f"CONFIG['ml_drl_policy_path'] at the .zip file."
+        )
+    from sb3_contrib import MaskablePPO
+    policy = MaskablePPO.load(str(path), device="cpu")
+    _ML_MODEL_CACHE[key] = policy
+    print(f"✓ Loaded DRL policy: {path}")
+    return policy
+
+
+def gatekeeper_for_mode(config: Dict[str, Any]):
+    """Return the gatekeeper model to use, or None for 'always upgrade-check'."""
+    mode = get_ml_mode(config)
+    if mode == "off":
+        return None
+    if mode == "deploy":
+        return load_gatekeeper(config["ml_gatekeeper_path"])
+
+    choice = str(config.get("ml_train_gatekeeper", "auto")).lower()
+    if choice == "always":
+        return None
+    if choice == "xgboost":
+        return load_gatekeeper(config["ml_gatekeeper_path"])
+    if choice == "auto":
+        if resolve_model_path(config["ml_gatekeeper_path"]).exists():
+            return load_gatekeeper(config["ml_gatekeeper_path"])
+        print("⚠️ ml_train_gatekeeper='auto': no gatekeeper JSON found -> every upgrade cycle is a DRL decision point.")
+        return None
+    raise ValueError(f"CONFIG['ml_train_gatekeeper'] must be 'auto', 'xgboost' or 'always', got {choice!r}")
+
+
+def gatekeeper_predict(gatekeeper, feature_row: Dict[str, float], threshold: float = 0.5):
+    """
+    XGBoost decision on the RAW feature row (same scale as the training CSV).
+    Columns are re-ordered to the model's stored feature names; any name the model
+    expects but the simulator did not produce raises immediately (no silent misalignment).
+    Returns (upgrade_needed: bool, probability: float).
+    """
+    if gatekeeper is None:
+        return True, 1.0
+
+    import pandas as pd
+    expected = list(gatekeeper.get_booster().feature_names)
+    missing = [c for c in expected if c not in feature_row]
+    if missing:
+        raise KeyError(
+            f"Gatekeeper expects {len(missing)} feature(s) the simulator did not produce, e.g. "
+            f"{missing[:5]}. The training CSV columns and build_feature_row() must use the same names."
+        )
+    X = pd.DataFrame([[float(feature_row[c]) for c in expected]], columns=expected)
+    prob = float(gatekeeper.predict_proba(X)[0][1])
+    return bool(prob >= threshold), prob
+
+
+def heuristic_safe_links(state: Dict[str, Any], algorithm, sd_last_block_prob, path_rank):
+    """
+    main.py's hard-coded link selection for one path rank (the exact calls the heuristics
+    make): select_links_for_upgrade -> network_connectivity -> sort by link score.
+    Returns the ordered list of safe candidate links (possibly empty).
+    """
+    config = state["config"]
+    upgrade_links, link_scores, top_contrib = algorithm.select_links_for_upgrade(
+        traffic_rates=state["traffic_rates"],
+        PATHS=state["PATHS"],
+        sd_block_prob=sd_last_block_prob,
+        block_threshold=PER_SD_BLOCK_THRESHOLD,
+        working_topology=state["working_topology"],
+        LINK_INDEX=state["LINK_INDEX"],
+        link_status_forward=state["link_status_forward"],
+        link_status_backward=state["link_status_backward"],
+        current_time=state["Current_global_time"],
+        path_stats=state["path_stats"],
+        path_rank=path_rank,
+        link_selection_mode=config.get("link_selection_mode", "path_congestion"),
+        link_score_threshold=config.get("link_score_threshold", PER_SD_BLOCK_THRESHOLD),
+    )
+    if not upgrade_links:
+        return []
+    safe_links = network_connectivity(upgrade_links, state["working_topology"], state["LINK_INDEX"])
+    return sorted(safe_links, key=lambda lid: float(link_scores.get(lid, 0.0)), reverse=True)
+
+
+def run_heuristic_upgrade(state: Dict[str, Any], algo_key, algorithm, sd_last_block_prob):
+    """
+    Akansha's heuristic upgrade cycle (path ranks 0..2, per-link rule, plan_checker),
+    unchanged. Used by ml_mode='off' and as the incremental fallback when the DRL's
+    proposal fails plan_checker. Does NOT commit; returns (plan_ok, final_links, final_decisions).
+    """
+    config = state["config"]
+    for path_rank in range(3):
+        safe_links = heuristic_safe_links(state, algorithm, sd_last_block_prob, path_rank)
+        if not safe_links:
+            continue
+
+        upgrade_decisions = {
+            lid: _algorithm_upgrade_decision(algo_key, algorithm, lid,
+                                             state["link_status_forward"], state["link_status_backward"])
+            for lid in safe_links
+        }
+
+        plan_ok, candidate_links, candidate_upgrade_decisions = plan_checker(
+            safe_links=safe_links,
+            upgrade_decisions=upgrade_decisions,
+            current_time=state["Current_global_time"],
+            PATHS=state["PATHS"],
+            current_traffic=state["traffic_rates"],
+            current_link_status_forward=copy.deepcopy(state["link_status_forward"]),
+            current_link_status_backward=copy.deepcopy(state["link_status_backward"]),
+            seed=state["seed"],
+            algorithm=algorithm,
+            budget_params=state["budget_params"],
+            budget_selection_mode=config.get("budget_selection_mode", "budget_aware"),
+            budget_tracker=state["budget_tracker"],
+        )
+        if plan_ok:
+            return True, candidate_links, candidate_upgrade_decisions
+    return False, [], {}
+
+
+def drl_candidate_links(state: Dict[str, Any], sd_last_block_prob):
+    """
+    Links the DRL may choose from: union (in rank order, no duplicates) of the safe links
+    main.py's hard-coded selection produces for path ranks 0..2.
+    """
+    seen, out = set(), []
+    for path_rank in range(3):
+        for lid in heuristic_safe_links(state, state["algorithm"], sd_last_block_prob, path_rank):
+            if lid not in seen:
+                seen.add(lid)
+                out.append(lid)
+    return out
+
+
+def get_fallback_algorithm(state: Dict[str, Any]):
+    """(algo_key, algorithm_object) used when the DRL proposal fails. Default: increment."""
+    key = state["config"].get("ml_fallback_algorithm", "increment")
+    if key == state["algorithm"].name:
+        return key, state["algorithm"]
+    return key, AlgorithmSelector.get_algorithm(key)
+
+
+def get_drl_link_ids(state: Dict[str, Any]):
+    """Fixed, sorted link ids captured at initialization (action layout: see action_to_choice)."""
+    return list(state["drl_link_ids"])
+
+
+def state_features(state: Dict[str, Any]):
+    """(raw_row, normalized_vector) for the current simulator state."""
+    return extract_313_features_standalone(
+        current_bbp=state["metrics"].get_blocking_probability(),
+        traffic_rates=state["traffic_rates"],
+        link_status_forward=state["link_status_forward"],
+        link_ids=get_drl_link_ids(state),
+    )
+
+
+def _algorithm_upgrade_decision(algo_key, algorithm, lid, link_status_forward, link_status_backward):
+    """Same per-link upgrade rule dispatch main.py uses for the heuristics."""
+    if algo_key == 'greedy':
+        dec = choose_upgrade_type_greedy_max(lid, link_status_forward, link_status_backward)
+    elif algo_key == 'jump_to_max':
+        dec = algorithm.get_upgrade_decision(lid, link_status_forward, link_status_backward)
+    elif algo_key == 'random':
+        dec = algorithm.get_random_upgrade_decision(lid, link_status_forward)
+    else:
+        dec = choose_upgrade_type(lid, link_status_forward, link_status_backward, algorithm)
+
+    if dec is None:
+        return []
+    if isinstance(dec, dict):
+        dec = [dec]
+    return [d for d in dec if d is not None and d.get("upgrade_type") is not None]
+
+
+##############################################################################
+# ### ML-INTEGRATION CHANGE M15 (Claude) ###
+# NEW (DRL chooses the upgrade LEVEL): each level is one of Akansha's per-link
+# upgrade rules (default: increment = next single step, greedy = greedy-max,
+# jump_to_max = straight to max technology). The DRL picks (link, level), and
+# the decision dicts come from that rule, so they stay well-formed for
+# perform_upgrade / plan_checker. CONFIG['ml_upgrade_levels'] = ['increment']
+# reproduces the previous links-only behaviour. (The DEFAULT is now
+# 'any_higher', see M17 below; a list of rule names still works.)
+##############################################################################
+##############################################################################
+# ### ML-INTEGRATION CHANGE M17 (Claude) ###
+# NEW: 'ANY HIGHER UPGRADE'. A link's technology state is its core mode
+# (single-core SC / multi-core MC) plus how many fibers are lit C and lit C+L.
+# With FIBERS=3 that gives 18 possible target states. The DRL picks a TARGET
+# state for a link; it is allowed only if it has MORE capacity than now and is
+# reachable without un-lighting a fiber or removing a band (SC->MC allowed via a
+# core upgrade, MC->SC never). The exact step list (several steps on one link
+# in one cycle is fine) is built here from the same moves Akansha's code allows:
+# band_upgrade on a lit C fiber, new_fiber_C / new_fiber_CL on a dark fiber,
+# core_upgrade from single-core. Each step is priced once by her cost model.
+##############################################################################
+ANY_HIGHER = "any_higher"
+
+
+def _any_higher_target_list():
+    out = []
+    for mode in ("SC", "MC"):
+        for total in range(1, FIBERS + 1):
+            for n_cl in range(0, total + 1):
+                out.append((mode, total - n_cl, n_cl))
+    return out
+
+
+ANY_HIGHER_TARGETS = _any_higher_target_list()            # 18 targets with FIBERS = 3
+
+
+def target_key(target) -> str:
+    mode, n_c, n_cl = target
+    return f"{mode}:{n_c}C+{n_cl}CL"
+
+
+TARGET_BY_KEY = {target_key(t): t for t in ANY_HIGHER_TARGETS}
+
+
+def link_capacity_slots(mode: str, n_c: int, n_cl: int) -> int:
+    """Total spectrum slots of a link state (per direction)."""
+    cores = Num_cores if mode == "MC" else 1
+    return cores * (n_c * C_BAND_SLOTS + n_cl * TOTAL_SLOTS)
+
+
+def link_tech_state(fibers: dict):
+    """(mode, {fiber_id: 'D' | 'C' | 'CL'}) using Akansha's own fiber helpers."""
+    from sim.upgrade.upgrade_manager import fiber_mode, is_fiber_lit, band_set_of_fiber
+    multi = any(isinstance(f, dict) and fiber_mode(f) == "multi" for f in fibers.values())
+    techs = {}
+    for fid, f in sorted(fibers.items()):
+        if not is_fiber_lit(f):
+            techs[fid] = "D"
+        else:
+            techs[fid] = "CL" if band_set_of_fiber(f) == {"C", "L"} else "C"
+    return ("MC" if multi else "SC"), techs
+
+
+def build_target_decisions(fibers: dict, target):
+    """
+    Step list that takes one link from its current state to `target`, or None if the
+    target is not higher / not reachable. Rule for which fibers change: band-upgrade
+    existing C fibers first (lowest fiber ids, matching her incremental order), then
+    light dark fibers as C+L for any remaining C+L needed, then as C.
+    """
+    mode_now, techs = link_tech_state(fibers)
+    mode_t, n_c_t, n_cl_t = target
+    n_c_now = sum(1 for t in techs.values() if t == "C")
+    n_cl_now = sum(1 for t in techs.values() if t == "CL")
+
+    if mode_now == "MC" and mode_t == "SC":
+        return None
+    if link_capacity_slots(mode_t, n_c_t, n_cl_t) <= link_capacity_slots(mode_now, n_c_now, n_cl_now):
+        return None
+
+    decs = []
+    if mode_now == "SC" and mode_t == "MC":
+        # her perform_upgrade: core_upgrade makes every fiber 3-core, only fiber 0 lit (C)
+        decs.append({"upgrade_type": "core_upgrade", "fiber_id": None, "core_type": 1})
+        techs = {fid: ("C" if fid == 0 else "D") for fid in techs}
+        core_type = 3
+    else:
+        core_type = 1 if mode_now == "SC" else 3
+
+    c_ids = sorted(f for f, t in techs.items() if t == "C")
+    dark_ids = sorted(f for f, t in techs.items() if t == "D")
+    cur_c, cur_cl = len(c_ids), sum(1 for t in techs.values() if t == "CL")
+    tot_now, tot_t = cur_c + cur_cl, n_c_t + n_cl_t
+    if n_cl_t < cur_cl or tot_t < tot_now:
+        return None                                   # would need removing a band / fiber
+
+    k = min(cur_c, n_cl_t - cur_cl)                   # existing C fibers -> C+L
+    new_cl = n_cl_t - cur_cl - k                      # dark fibers lit as C+L
+    new_c = (tot_t - tot_now) - new_cl                # dark fibers lit as C
+    if new_c < 0 or new_cl + new_c > len(dark_ids):
+        return None
+
+    for fid in c_ids[:k]:
+        decs.append({"upgrade_type": "band_upgrade", "fiber_id": fid, "core_type": core_type})
+    for fid in dark_ids[:new_cl]:
+        decs.append({"upgrade_type": "new_fiber_CL", "fiber_id": fid, "core_type": core_type})
+    for fid in dark_ids[new_cl:new_cl + new_c]:
+        decs.append({"upgrade_type": "new_fiber_C", "fiber_id": fid, "core_type": core_type})
+    return decs or None
+
+
+def get_upgrade_levels(state: Dict[str, Any]):
+    """Ordered list of upgrade-level names (= algorithm keys whose per-link rule defines the level)."""
+    levels = state["config"].get("ml_upgrade_levels", ["increment"])
+    if levels == ANY_HIGHER:
+        return [target_key(t) for t in ANY_HIGHER_TARGETS]
+    levels = list(levels)
+    if not levels:
+        raise ValueError("CONFIG['ml_upgrade_levels'] must list at least one level")
+    return levels
+
+
+def _level_algorithm(state: Dict[str, Any], level_key):
+    """Algorithm object whose per-link rule generates this level's decisions (cached)."""
+    if level_key == state["algorithm"].name:
+        return state["algorithm"]
+    cache = state.setdefault("level_algorithms", {})
+    if level_key not in cache:
+        cache[level_key] = AlgorithmSelector.get_algorithm(level_key)
+    return cache[level_key]
+
+
+def build_link_upgrade_proposal(state: Dict[str, Any], link_id, level_key=None):
+    """
+    Turn a (link, level) choice into main.py's (safe_links, upgrade_decisions) format.
+    The upgrade decisions (type, fiber_id, core_type) come from the per-link rule named by
+    level_key (default: CONFIG['ml_base_algorithm']), so perform_upgrade / plan_checker
+    receive fully-formed decision dicts. Returns None if no upgrade is physically possible.
+    """
+    if level_key is None:
+        level_key = state["config"].get("ml_base_algorithm", "increment")
+    decs = _algorithm_upgrade_decision(
+        level_key,
+        _level_algorithm(state, level_key),
+        link_id,
+        state["link_status_forward"],
+        state["link_status_backward"],
+    )
+    if not decs:
+        return None
+    return [link_id], {link_id: decs}
+
+
+def remaining_budget_snapshot(state: Dict[str, Any]) -> Dict[str, float]:
+    """
+    O(1), read-only view of the remaining annual budget (same arithmetic as
+    plan_checker._compute_cycle_budget_components, but no prints and no mutation).
+    """
+    budget_params = state["budget_params"]
+    budget_tracker = state["budget_tracker"]
+    year_idx = int(state["Current_global_time"] // 365)
+
+    if year_idx in budget_tracker:
+        y = budget_tracker[year_idx]
+        return {
+            "opex": max(y["opex_budget"] - y["used_opex"], 0.0),
+            "capex": max(y["capex_budget"] - y["used_capex"], 0.0),
+            "total": max(y["total_budget"] - y["used_total"], 0.0),
+        }
+
+    growth = (1.0 + float(budget_params["inflation_rate"])) ** year_idx
+    return {
+        "opex": float(budget_params["period_opex_budget_0"]) * growth,
+        "capex": float(budget_params["period_capex_budget_0"]) * growth,
+        "total": float(budget_params["period_total_budget_0"]) * growth,
+    }
+
+
+##############################################################################
+# ### ML-INTEGRATION CHANGE M14 (Claude) ###
+# NEW (multi-link selection): proposal for the links picked so far this cycle,
+# and their cost/downtime computed with the SAME formulas plan_checker uses
+# (compute_upgrade_costs and plan_checker._compute_total_downtime; read-only,
+# plan_checker.py itself is not modified).
+##############################################################################
+##############################################################################
+# ### ML-INTEGRATION CHANGE M16 (Claude) ###
+# NEW: is this upgrade cycle the last one before the budget year resets?
+##############################################################################
+def is_last_cycle_of_budget_year(current_time: float) -> bool:
+    """True if the NEXT upgrade cycle falls in a different budget year than this one,
+    i.e. any budget not used now is lost (budgets reset every 365 days, no carry-over)."""
+    next_cycle_time = float(current_time) + float(Upgrade_initiation_days)
+    return int(next_cycle_time // 365) != int(float(current_time) // 365)
+
+
+def _link_level_decisions(state: Dict[str, Any], pending, link_id, level_key):
+    """Decisions for one (link, level), cached for the whole cycle. None if impossible."""
+    cache = pending.setdefault("proposal_cache", {})
+    key = (link_id, level_key)
+    if key not in cache:
+        if level_key in TARGET_BY_KEY:                     # M17: any-higher target state
+            cache[key] = build_target_decisions(state["link_status_forward"][link_id],
+                                                TARGET_BY_KEY[level_key])
+        else:                                              # M15: one of her per-link rules
+            proposal = build_link_upgrade_proposal(state, link_id, level_key)
+            cache[key] = None if proposal is None else proposal[1][link_id]
+    return cache[key]
+
+
+def _selected_decisions(state: Dict[str, Any], pending, extra=None):
+    """
+    {link: [decisions]} for the (link, level) picks made so far this cycle, plus optionally
+    one more pick `extra` = (link, level). Returns None if `extra` has no possible upgrade.
+    """
+    picks = [(lid, pending["selected_levels"][lid]) for lid in pending["selected_links"]]
+    if extra is not None:
+        picks.append(tuple(extra))
+    out = {}
+    for lid, level in picks:
+        decs = _link_level_decisions(state, pending, lid, level)
+        if decs is None:
+            return None
+        out[lid] = decs
+    return out
+
+
+def selection_usage(state: Dict[str, Any], decisions) -> Dict[str, float]:
+    """
+    O(1) cost/downtime of a candidate selection, using the SAME formulas plan_checker uses:
+      - CAPEX+workforce: compute_upgrade_costs over the whole selection
+      - downtime: plan_checker._compute_total_downtime (per-link max, summed over links,
+        because downtime jobs run one link at a time)
+    """
+    # Load the plan_checker MODULE by full name. `from sim.upgrade import plan_checker`
+    # would return the plan_checker FUNCTION, because sim/upgrade/__init__.py does
+    # `from .plan_checker import *`, which shadows the module name.
+    import importlib
+    _pc_module = importlib.import_module("sim.upgrade.plan_checker")
+    if not decisions:
+        return {"capex": 0.0, "downtime": 0.0}
+    _, cost_summary, _ = compute_upgrade_costs(
+        safe_links_for_upgrade=list(decisions.keys()),
+        upgrade_decisions=decisions,
+        algorithm_name=state["algorithm"].name,
+    )
+    capex = float(cost_summary.get("equipment_total", 0.0)) + float(cost_summary.get("workforce_total", 0.0))
+    downtime = float(_pc_module._compute_total_downtime(decisions, state["algorithm"].name))
+    return {"capex": capex, "downtime": downtime}
+
+
+##############################################################################
+# ### ML-INTEGRATION CHANGE M14 (Claude) ###
+# CHANGED (multi-link): a link is selectable only if the WHOLE selection incl.
+# that link still fits the CAPEX/TOTAL budget and the downtime limit.
+# STOP only when nothing else fits.
+# M15: the mask is now over (link, upgrade level) pairs; a level that gives the
+# same upgrade as a lower level for that link is masked out.
+##############################################################################
+def drl_action_count(state: Dict[str, Any]) -> int:
+    """Number of DRL actions = n_links * n_levels + 1 (STOP)."""
+    return len(get_drl_link_ids(state)) * len(get_upgrade_levels(state)) + 1
+
+
+def compute_drl_action_mask(state: Dict[str, Any]) -> np.ndarray:
+    """
+    Mask for the NEXT pick of the current cycle (O(1) per action, no traffic simulation).
+    Action layout: index = link_index * n_levels + level_index; last index = STOP.
+    A (link, level) action is selectable if ALL hold
+      - the link is one of main.py's hard-coded candidate links for this cycle
+      - the link has not already been picked this cycle (one level per link per cycle)
+      - that level's rule gives a physically possible upgrade for the link, and it is not
+        identical to a lower level's upgrade (duplicates are masked out)
+      - it has no upgrade job already queued / in progress
+      - taking it down keeps the network connected (same check heuristics use)
+      - the WHOLE selection incl. this link fits the remaining annual CAPEX and TOTAL
+        budget (budget_aware only)
+      - the WHOLE selection's sequential downtime fits Upgrade_initiation_days
+    STOP (last index) = finish this cycle's selection. Valid when no link is selectable, or
+    (M16) when saving is allowed and this is NOT the last cycle of the budget year. In the
+    year's last cycle the DRL must keep picking while anything fits. OPEX and projected BBP
+    are left to plan_checker.
+    """
+    link_ids = get_drl_link_ids(state)
+    levels = get_upgrade_levels(state)
+    mask = np.zeros(drl_action_count(state), dtype=bool)
+
+    pending = state.get("pending_drl_decision")
+    if pending is None:
+        mask[-1] = True
+        return mask
+
+    candidates = set(pending["candidate_links"])
+    selected = set(pending["selected_links"])
+    busy = set(state["link_execution_queue"]) | {lid for lid, d in state["per_link_jobs"].items() if d}
+    budget_aware = (state["config"].get("budget_selection_mode", "budget_aware") == "budget_aware")
+    remaining = remaining_budget_snapshot(state) if budget_aware else None
+    downtime_limit = float(Upgrade_initiation_days)
+
+    for link_idx, lid in enumerate(link_ids):
+        if lid not in candidates or lid in selected or lid in busy or lid not in state["link_status_forward"]:
+            continue
+        safe = network_connectivity([lid], state["working_topology"], state["LINK_INDEX"])
+        if lid not in list(safe or []):
+            continue
+        seen_decisions = []
+        for level_idx, level in enumerate(levels):
+            own = _link_level_decisions(state, pending, lid, level)
+            if own is None or own in seen_decisions:
+                continue                      # impossible, or same upgrade as a lower level
+            seen_decisions.append(own)
+            decisions = _selected_decisions(state, pending, extra=(lid, level))
+            usage = selection_usage(state, decisions)
+            if usage["downtime"] > downtime_limit:
+                continue
+            if budget_aware and (usage["capex"] > remaining["capex"] or usage["capex"] > remaining["total"]):
+                continue
+            mask[link_idx * len(levels) + level_idx] = True
+
+    # STOP rule (M16): always allowed when nothing else fits. Otherwise allowed only
+    # when saving is enabled AND this is not the last cycle of the budget year.
+    cfg = state["config"]
+    must_spend = (bool(cfg.get("ml_spend_all_last_cycle_of_year", True))
+                  and is_last_cycle_of_budget_year(state["Current_global_time"]))
+    if pending.get("gatekeeper_override") and not cfg.get("ml_year_end_override_forces_spend", False):
+        must_spend = False      # gatekeeper said "no": the DRL decides whether to spend at all
+    allow_stop = bool(cfg.get("ml_allow_early_stop", False)) and not must_spend
+    mask[-1] = (not mask[:-1].any()) or allow_stop
+    return mask
+
+
+##############################################################################
+# ### ML-INTEGRATION CHANGE M14 (Claude) ###
+# NEW: DRL observation (335 values on dt12) = 313 features + 20 picked values
+# (0 = not picked, else which level it was picked at, M15)
+# + remaining CAPEX fraction + remaining downtime fraction.
+##############################################################################
+def drl_observation(state: Dict[str, Any]) -> np.ndarray:
+    """
+    DRL observation = [ the 313 normalized network features (identical to everywhere else),
+                        one value per link: 0 = not picked this cycle, otherwise
+                        (level_index + 1) / n_levels for the level it was picked at,
+                        remaining CAPEX fraction after the current picks,
+                        remaining downtime fraction after the current picks,
+                        1 if this is the last cycle of the budget year else 0 (M16) ].
+    The extra values tell the agent what it has already chosen and how much room is left,
+    which it needs to choose sensibly within a cycle. XGBoost still gets only the 313 raw
+    features.
+    """
+    _, base = state_features(state)
+    link_ids = get_drl_link_ids(state)
+    picked = np.zeros(len(link_ids), dtype=np.float32)
+    capex_frac = downtime_frac = 1.0
+
+    pending = state.get("pending_drl_decision")
+    if pending is not None:
+        levels = get_upgrade_levels(state)
+        chosen = pending["selected_levels"]
+        picked = np.array([(levels.index(chosen[lid]) + 1) / len(levels) if lid in chosen else 0.0
+                           for lid in link_ids], dtype=np.float32)
+        usage = selection_usage(state, _selected_decisions(state, pending) or {})
+        downtime_frac = 1.0 - usage["downtime"] / float(Upgrade_initiation_days)
+        if state["config"].get("budget_selection_mode", "budget_aware") == "budget_aware":
+            year_idx = int(state["Current_global_time"] // 365)
+            growth = (1.0 + float(state["budget_params"]["inflation_rate"])) ** year_idx
+            annual_capex = float(state["budget_params"]["period_capex_budget_0"]) * growth
+            remaining = remaining_budget_snapshot(state)
+            capex_frac = (min(remaining["capex"], remaining["total"]) - usage["capex"]) / max(annual_capex, 1e-9)
+
+    # M16: 1.0 if this is the last cycle before the budget resets (use it or lose it)
+    last_cycle_flag = 1.0 if is_last_cycle_of_budget_year(state["Current_global_time"]) else 0.0
+    extra = np.clip(np.array([capex_frac, downtime_frac, last_cycle_flag], dtype=np.float32), 0.0, 1.0)
+    return np.concatenate([base, picked, extra]).astype(np.float32)
+
+
+def action_to_choice(state: Dict[str, Any], action):
+    """Discrete action index -> (link_id, level_name), or None for STOP (last index)."""
+    link_ids, levels = get_drl_link_ids(state), get_upgrade_levels(state)
+    a, n = int(action), drl_action_count(state)
+    if a < 0 or a >= n:
+        raise ValueError(f"Action {a} out of range [0, {n - 1}]")
+    if a == n - 1:
+        return None
+    return link_ids[a // len(levels)], levels[a % len(levels)]
+
+
+def log_pre_upgrade_per_link_state(writer, link_status_forward, cycle_idx, time_day):
+    for link_id, fibers in link_status_forward.items():
+        sc_c = sc_cl = mc_c = mc_cl = 0
+        for fiber_id, fiber_obj in fibers.items():
+            f_state = classify_fiber_state(fiber_obj)
+            if f_state == "SC_C":
+                sc_c += 1
+            elif f_state == "SC_CL":
+                sc_cl += 1
+            elif f_state == "MC_C":
+                mc_c += 3
+            elif f_state == "MC_CL":
+                mc_cl += 3
+
+        writer.writerow([
+            int(cycle_idx),
+            float(time_day),
+            int(link_id),
+            sc_c,
+            sc_cl,
+            mc_c,
+            mc_cl,
+        ])
+
+
+def commit_upgrade_plan(state: Dict[str, Any], final_links, final_upgrade_decisions, period_index):
+    """
+    Execute an ACCEPTED plan_checker plan: logging, cost accounting, immediate
+    new_fiber_C upgrades, and downtime job queue. Shared by the heuristics and the ML
+    pipeline so both use identical physics/accounting. Reads and writes `state` in place.
+    """
+    metrics = state["metrics"]
+    algorithm = state["algorithm"]
+    Current_global_time = state["Current_global_time"]
+    current_upgrade = state["current_upgrade"]
+    upgrade_cost_timeline = state["upgrade_cost_timeline"]
+    upgrade_log_csv = state["upgrade_log_csv"]
+    total_network_cost = state["total_network_cost"]
+    link_status_forward = state["link_status_forward"]
+    link_status_backward = state["link_status_backward"]
+
+    state["path_stats"].clear()
+    safe_links = final_links
+    upgrade_decisions = final_upgrade_decisions
+    flat_final_decisions = flatten_upgrade_decisions(upgrade_decisions)
+
+    log_pre_upgrade_per_link_state(
+        state["pre_upgrade_per_link_writer"], link_status_forward,
+        cycle_idx=current_upgrade, time_day=Current_global_time,
+    )
+
+    state["upgrade_decision_history"].append({
+        "cycle": int(current_upgrade),
+        "time_day": float(Current_global_time),
+        "blocking_probability": float(metrics.get_blocking_probability()),
+        "final_decisions": flat_final_decisions,
+        "cycle_upgrade_level": get_cycle_upgrade_level(flat_final_decisions),
+    })
+
+    state["upgrade_cycle_writer"].writerow([
+        int(current_upgrade),
+        float(Current_global_time),
+        float(metrics.get_blocking_probability()),
+        len(safe_links),
+        str(list(safe_links)),
+        str(flat_final_decisions),
+        get_cycle_upgrade_level(flat_final_decisions),
+    ])
+    print_upgrade_decisions_summary(Current_global_time, safe_links, upgrade_decisions)
+
+    immediate_actions = {}
+    per_link_jobs = {}
+
+    for lid in safe_links:
+        decs = upgrade_decisions.get(lid, [])
+        decs = [decs] if isinstance(decs, dict) else list(decs)
+        has_core = any(d.get("upgrade_type") == "core_upgrade" for d in decs)
+
+        immediate_actions[lid] = []
+        per_link_jobs[lid] = []
+
+        if has_core:
+            per_link_jobs[lid] = list(decs)
+        else:
+            for dec in decs:
+                if dec is None or dec.get("upgrade_type") is None:
+                    continue
+                utype = dec.get("upgrade_type")
+                if utype == "new_fiber_C":
+                    immediate_actions[lid].append(dec)
+                else:
+                    per_link_jobs[lid].append(dec)
+
+    immediate_actions = {lid: decs for lid, decs in immediate_actions.items() if decs}
+    per_link_jobs = {lid: decs for lid, decs in per_link_jobs.items() if decs}
+    link_execution_queue = [lid for lid in safe_links if lid in per_link_jobs]
+
+    cycle_actions = {}
+    for lid, decs in immediate_actions.items():
+        cycle_actions.setdefault(lid, []).extend(decs)
+    for lid, decs in per_link_jobs.items():
+        cycle_actions.setdefault(lid, []).extend(decs)
+
+    cycle_links = sorted(cycle_actions.keys())
+
+    total_cost_cycle, cost_summary, cost_details = compute_upgrade_costs(
+        safe_links_for_upgrade=cycle_links,
+        upgrade_decisions=cycle_actions,
+        algorithm_name=algorithm.name
+    )
+
+    equip = float(cost_summary.get("equipment_total", 0.0))
+    work = float(cost_summary.get("workforce_total", 0.0))
+    capex_work_cycle = equip + work
+    total_network_cost += capex_work_cycle
+
+    day_marker = int(Current_global_time)
+    if not upgrade_cost_timeline or int(upgrade_cost_timeline[-1].get("day", -1)) != day_marker:
+        upgrade_cost_timeline.append({
+            "day": float(day_marker),
+            "equipment": 0.0,
+            "workforce": 0.0,
+            "opex": 0.0,
+            "total": 0.0,
+            "cumulative_total": float(total_network_cost),
+        })
+
+    row = upgrade_cost_timeline[-1]
+    row["equipment"] = float(row.get("equipment", 0.0)) + equip
+    row["workforce"] = float(row.get("workforce", 0.0)) + work
+    row["total"] = (
+        float(row.get("equipment", 0.0))
+        + float(row.get("workforce", 0.0))
+        + float(row.get("opex", 0.0))
+    )
+    row["cumulative_total"] = float(total_network_cost)
+
+    if immediate_actions:
+        immediate_links = sorted(immediate_actions.keys())
+        for link_id, decs in immediate_actions.items():
+            for dec in decs:
+                log_upgrade_action(
+                    upgrade_log_csv,
+                    day=Current_global_time,
+                    period_index=period_index,
+                    scope="immediate",
+                    link_id=link_id,
+                    upgrade_type=dec.get("upgrade_type", ""),
+                    fiber_id=dec.get("fiber_id", None),
+                    core_type=dec.get("core_type", None),
+                )
+
+        perform_upgrade(
+            immediate_links,
+            immediate_actions,
+            link_status_forward,
+            link_status_backward,
+            C_BAND_SLOTS,
+            TOTAL_SLOTS,
+            Current_global_time,
+            algorithm
+        )
+
+    (
+        link_execution_queue,
+        per_link_jobs,
+        working_topology,
+        link_status_forward,
+        link_status_backward,
+        removed_links_info,
+        ALL_DEMANDS,
+        total_network_cost,
+        PATHS,
+    ) = start_next_link_job(
+        link_execution_queue=link_execution_queue,
+        per_link_jobs=per_link_jobs,
+        current_time=Current_global_time,
+        period_index=period_index,
+        working_topology=state["working_topology"],
+        link_status_forward=link_status_forward,
+        link_status_backward=link_status_backward,
+        removed_links_info=state["removed_links_info"],
+        ALL_DEMANDS=state["ALL_DEMANDS"],
+        total_network_cost=total_network_cost,
+        PATHS=state["PATHS"],
+        upgrade_log_csv=upgrade_log_csv,
+        upgrade_cost_timeline=upgrade_cost_timeline,
+        algorithm=algorithm,
+    )
+
+    state["link_execution_queue"] = link_execution_queue
+    state["per_link_jobs"] = per_link_jobs
+    state["working_topology"] = working_topology
+    state["link_status_forward"] = link_status_forward
+    state["link_status_backward"] = link_status_backward
+    state["removed_links_info"] = removed_links_info
+    state["ALL_DEMANDS"] = ALL_DEMANDS
+    state["total_network_cost"] = total_network_cost
+    state["PATHS"] = PATHS
+
+
+##############################################################################
+# ### ML-INTEGRATION CHANGE M14 (Claude) ###
+# NEW/CHANGED (multi-link): apply_drl_decision adds one (link, level) pick at a time;
+# _finalize_drl_cycle sends the whole selection to plan_checker once and
+# falls back to incremental on FAIL. Replaces the old single-link version.
+##############################################################################
+def _finalize_drl_cycle(state: Dict[str, Any], pending, stop_reason) -> Dict[str, Any]:
+    """
+    Send the DRL's whole selection for this cycle to plan_checker once.
+      PASS -> commit.
+      FAIL (or nothing selected) -> nothing spent (plan_checker only commits on PASS);
+                                    the cycle FALLS BACK to the incremental heuristic.
+      Deliberate save (STOP with nothing picked, M16) -> nothing spent, NO fallback.
+    """
+    selected = list(pending["selected_links"])
+    decisions = _selected_decisions(state, pending) or {}
+
+    result = {
+        "cycle": pending["cycle"],
+        "time_day": float(state["Current_global_time"]),
+        "n_candidates": len(pending["candidate_links"]),
+        "selected_links": selected,
+        "selected_levels": {lid: pending["selected_levels"][lid] for lid in selected},
+        "n_selected": len(selected),
+        "stop_reason": stop_reason,
+        "status": None,
+        "plan_ok": False,
+        "fallback": None,
+        "final_links": [],
+        "final_decisions": {},
+        "gatekeeper_prob": pending.get("gatekeeper_prob"),
+        "last_cycle_of_year": is_last_cycle_of_budget_year(state["Current_global_time"]),
+        "gatekeeper_override": bool(pending.get("gatekeeper_override", False)),
+        "cycle_complete": True,
+    }
+    state["pending_drl_decision"] = None
+
+    if not selected and stop_reason == "early_stop":
+        # M16: the DRL deliberately saved this cycle's budget for later in the year.
+        # Respected: no incremental fallback (that would spend the money anyway).
+        result["status"] = "saved_budget"
+    elif not selected:
+        result["status"] = "nothing_selected"
+    else:
+        config = state["config"]
+        plan_ok, final_links, final_upgrade_decisions = plan_checker(
+            safe_links=selected,
+            upgrade_decisions=decisions,
+            current_time=state["Current_global_time"],
+            PATHS=state["PATHS"],
+            current_traffic=state["traffic_rates"],
+            current_link_status_forward=copy.deepcopy(state["link_status_forward"]),
+            current_link_status_backward=copy.deepcopy(state["link_status_backward"]),
+            seed=state["seed"],
+            algorithm=state["algorithm"],
+            budget_params=state["budget_params"],
+            budget_selection_mode=config.get("budget_selection_mode", "budget_aware"),
+            budget_tracker=state["budget_tracker"],
+        )
+        if plan_ok:
+            commit_upgrade_plan(state, final_links, final_upgrade_decisions, pending["period_index"])
+            result.update(status="executed", plan_ok=True,
+                          final_links=list(final_links), final_decisions=final_upgrade_decisions)
+        else:
+            result["status"] = "rejected_by_plan_checker"
+
+    if result["status"] not in ("executed", "saved_budget"):
+        fb_key, fb_algorithm = get_fallback_algorithm(state)
+        print(f">>> DRL {result['status']} -> falling back to '{fb_key}' for this cycle")
+        fb_ok, fb_links, fb_decisions = run_heuristic_upgrade(
+            state, fb_key, fb_algorithm, pending["sd_last_block_prob"]
+        )
+        if fb_ok:
+            commit_upgrade_plan(state, fb_links, fb_decisions, pending["period_index"])
+            result.update(fallback="executed", final_links=list(fb_links), final_decisions=fb_decisions)
+        else:
+            result["fallback"] = "failed"
+
+    picked_txt = ", ".join(f"{lid}:{result['selected_levels'][lid]}" for lid in selected)
+    print(f">>> DRL cycle {result['cycle']}: selected [{picked_txt}] ({stop_reason}) -> {result['status']}"
+          + (f" | fallback: {result['fallback']}" if result["fallback"] else ""))
+    state["drl_decision_log"].append({k: v for k, v in result.items()
+                                      if k not in ("final_decisions", "cycle_complete")})
+    state["last_drl_result"] = result
+    return result
+
+
+def apply_drl_decision(state: Dict[str, Any], action) -> Dict[str, Any]:
+    """
+    Apply ONE pick of the DRL at the pending decision point.
+      action = (link, level) index -> add that link at that upgrade level to this cycle's
+               selection. If no further pick
+               fits the remaining budget/downtime, the selection is finalized right away.
+      action = STOP (last index; only unmasked when nothing else fits, or when
+               CONFIG['ml_allow_early_stop'] is True) -> finalize.
+    Finalizing = plan_checker on the whole selection; FAIL -> incremental fallback.
+    Returns {"cycle_complete": False, ...} while the cycle is still being built, or the
+    final cycle result (cycle_complete=True) from _finalize_drl_cycle().
+    """
+    pending = state.get("pending_drl_decision")
+    if pending is None:
+        raise RuntimeError("apply_drl_decision() called but no DRL decision is pending.")
+
+    mask = compute_drl_action_mask(state)
+    action = int(action)
+    choice = action_to_choice(state, action)
+
+    if not mask[action]:
+        print(f"⚠️ DRL chose masked-out action {action} ({choice}); treating it as STOP.")
+        return _finalize_drl_cycle(state, pending, "invalid_action")
+
+    if choice is None:
+        reason = "no_feasible_link_left" if not mask[:-1].any() else "early_stop"
+        return _finalize_drl_cycle(state, pending, reason)
+
+    link_id, level = choice
+    pending["selected_links"].append(link_id)
+    pending["selected_levels"][link_id] = level
+    next_mask = compute_drl_action_mask(state)
+    if not next_mask[:-1].any():
+        return _finalize_drl_cycle(state, pending, "no_feasible_link_left")
+
+    return {"cycle_complete": False, "picked_link": link_id, "picked_level": level,
+            "selected_links": list(pending["selected_links"]),
+            "selected_levels": dict(pending["selected_levels"])}
+
+
+def drl_policy_action(state: Dict[str, Any], policy) -> int:
+    """Deploy-time inference: one masked, deterministic pick from the trained policy."""
+    obs = drl_observation(state)
+    mask = compute_drl_action_mask(state)
+
+    if tuple(policy.observation_space.shape) != tuple(obs.shape):
+        raise ValueError(
+            f"DRL policy expects observation shape {policy.observation_space.shape}, simulator "
+            f"produces {obs.shape}. Was the policy trained with a different topology or an "
+            f"older DRL_code.py? Retrain with the current DRL_code.py."
+        )
+    if int(policy.action_space.n) != len(mask):
+        raise ValueError(
+            f"DRL policy has {policy.action_space.n} actions, simulator needs {len(mask)} "
+            f"(links x upgrade levels + STOP). Was it trained with a different topology or "
+            f"different CONFIG['ml_upgrade_levels']?"
+        )
+
+    action, _ = policy.predict(obs, action_masks=mask, deterministic=True)
+    return int(np.asarray(action).item())
+
+
+def close_state_files(state: Dict[str, Any]):
+    """Close every CSV handle opened by initialize_simulation_state (safe to call twice)."""
+    for key in ("connection_log_file", "daily_network_file", "upgrade_cycle_file", "pre_upgrade_per_link_file"):
+        f = state.get(key)
+        try:
+            if f is not None and not f.closed:
+                f.close()
+        except Exception:
+            pass
+
+
+##############################################################################
+# ### ML-INTEGRATION CHANGE M4 — END ###
+# End of the new ML helper block. Original code continues below.
+##############################################################################
 # ============================================================================
 # Helper Functions
 # ============================================================================
@@ -361,11 +1798,23 @@ def initialize_simulation(config: Dict[str, Any]):
     Topology.N = topology_data['N']
     Topology.LINKS = topology_data['LINKS']
 
-    # Load algorithm
-    algorithm = AlgorithmSelector.get_algorithm(config['algorithm'])
+    ##############################################################################
+    # ### ML-INTEGRATION CHANGE M5 (Claude) ###
+    # Was: algorithm = AlgorithmSelector.get_algorithm(config['algorithm'])
+    #      results_dir = create_results_directory(config['topology'], config['algorithm'])
+    # Now: in ML modes load CONFIG['ml_base_algorithm'] and label the results
+    #      folder ml_train / ml_deploy. ml_mode='off' is identical to before.
+    ##############################################################################
+    # Load algorithm.
+    # In ML modes the algorithm object is the BASE algorithm: it supplies the per-link
+    # upgrade rule for the DRL's chosen link and is what plan_checker / perform_upgrade
+    # use internally (escalation, cost naming). Heuristic link selection is NOT used.
+    ml_mode = get_ml_mode(config)
+    algo_key = config['algorithm'] if ml_mode == "off" else config.get('ml_base_algorithm', 'increment')
+    algorithm = AlgorithmSelector.get_algorithm(algo_key)
 
     # Create results directory
-    results_dir = create_results_directory(config['topology'], config['algorithm'])
+    results_dir = create_results_directory(config['topology'], get_run_label(config))
     upgrade_log_csv = init_upgrade_log(results_dir)
 
     # Extend config with simulation parameters and output paths
@@ -554,10 +2003,35 @@ def initialize_simulation_state(config: Dict[str, Any]) -> Dict[str, Any]:
     if not PATHS:
         raise ValueError("build_k_shortest_paths() returned empty structure")
 
+    ##############################################################################
+    # ### ML-INTEGRATION CHANGE M6 (Claude) ###
+    # ADDED: turn off XGBoost data logging in ML modes, load the gatekeeper,
+    # freeze the link order used for DRL actions/features.
+    ##############################################################################
+    # ML pipeline state
+    ml_mode = get_ml_mode(config)
+    if ml_mode != "off":
+        # Gatekeeper/DRL decide; the heuristic's check_need_for_upgrade labels are not computed.
+        config["collect_xgboost_data"] = False
+    gatekeeper = gatekeeper_for_mode(config)
+    drl_link_ids = sorted(link_status_forward.keys())   # fixed action/feature order for the whole run
+    print(f"ML mode: {ml_mode}" + (f" (base algorithm: {algorithm.name}, {len(drl_link_ids)} links)"
+                                   if ml_mode != "off" else ""))
+
     print("✓ Simulation initialized\n")
 
     # Return unified state dictionary
     return {
+        ##############################################################################
+        # ### ML-INTEGRATION CHANGE M6 (Claude) ###
+        # ADDED state keys: gatekeeper, drl_link_ids, pending_drl_decision,
+        # drl_decision_log, last_drl_result. All original keys are unchanged below.
+        ##############################################################################
+        "gatekeeper": gatekeeper,
+        "drl_link_ids": drl_link_ids,
+        "pending_drl_decision": None,
+        "drl_decision_log": [],
+        "last_drl_result": None,
         "config": config,
         "algorithm": algorithm,
         "results_dir": results_dir,
@@ -827,9 +2301,24 @@ def start_next_link_job(
 
 def run_single_cycle(state: Dict[str, Any], action: Optional[Any] = None) -> Tuple[Dict[str, Any], float, bool]:
     """
-    Executes exactly ONE event step of the simulation loop.
+    Executes exactly ONE event step (one connection arrival) of the simulation loop.
     Returns: (updated_state, reward, done)
+
+    In ML modes, when an upgrade cycle triggers and the gatekeeper says an upgrade is
+    needed, state["pending_drl_decision"] is set and the caller must resolve it with
+    apply_drl_decision(state, action) before calling run_single_cycle again.
+    The `action` argument is unused and kept only for backward compatibility.
     """
+    ##############################################################################
+    # ### ML-INTEGRATION CHANGE M7 (Claude) ###
+    # ADDED (plus the docstring text above): refuse to advance while a DRL
+    # decision is pending. It must be resolved with apply_drl_decision().
+    ##############################################################################
+    if state.get("pending_drl_decision") is not None:
+        raise RuntimeError(
+            "A DRL decision is pending. Call apply_drl_decision(state, action) "
+            "before advancing the simulation."
+        )
     # --- 1. UNPACK ENVIRONMENT STATE ---
     config = state["config"]
     algorithm = state["algorithm"]
@@ -940,57 +2429,45 @@ def run_single_cycle(state: Dict[str, Any], action: Optional[Any] = None) -> Tup
             active_connections,
         ])
 
-    def classify_fiber_state(fiber_obj):
-        if not isinstance(fiber_obj, dict):
-            return None
+    ##############################################################################
+    # ### ML-INTEGRATION CHANGE M8 (Claude) ###
+    # REMOVED here: nested classify_fiber_state() and log_pre_upgrade_per_link_state()
+    # (now top level, M2 / M4).
+    # ADDED: _sync_to_state() / _sync_from_state() so locals and the state dict
+    # stay consistent around state-based helpers (commit_upgrade_plan etc.).
+    ##############################################################################
+    def _sync_to_state():
+        """Write every (possibly reassigned) local back into state."""
+        state["Current_global_time"] = Current_global_time
+        state["current_week"] = current_week
+        state["current_upgrade"] = current_upgrade
+        state["current_month"] = current_month
+        state["last_cost_time"] = last_cost_time
+        state["last_logged_day"] = last_logged_day
+        state["total_network_cost"] = total_network_cost
+        state["connection_id"] = connection_id
+        state["working_topology"] = working_topology
+        state["link_status_forward"] = link_status_forward
+        state["link_status_backward"] = link_status_backward
+        state["removed_links_info"] = removed_links_info
+        state["ALL_DEMANDS"] = ALL_DEMANDS
+        state["PATHS"] = PATHS
+        state["link_execution_queue"] = link_execution_queue
+        state["per_link_jobs"] = per_link_jobs
 
-        if "lit" in fiber_obj and "bands" in fiber_obj:
-            if not fiber_obj.get("lit", False):
-                return None
-            bands = set(fiber_obj.get("bands", []))
-            if bands == {"C"}:
-                return "SC_C"
-            elif bands == {"C", "L"}:
-                return "SC_CL"
-            return None
-
-        core_keys = [k for k in fiber_obj.keys() if isinstance(k, int)]
-        if core_keys:
-            lit_cores = []
-            all_bands = set()
-            for ck in core_keys:
-                core = fiber_obj.get(ck, {})
-                if isinstance(core, dict) and core.get("lit", False):
-                    lit_cores.append(ck)
-                    all_bands.update(core.get("bands", []))
-            if not lit_cores:
-                return None
-            return "MC_CL" if "L" in all_bands else "MC_C"
-        return None
-
-    def log_pre_upgrade_per_link_state(cycle_idx, time_day):
-        for link_id, fibers in link_status_forward.items():
-            sc_c = sc_cl = mc_c = mc_cl = 0
-            for fiber_id, fiber_obj in fibers.items():
-                f_state = classify_fiber_state(fiber_obj)
-                if f_state == "SC_C":
-                    sc_c += 1
-                elif f_state == "SC_CL":
-                    sc_cl += 1
-                elif f_state == "MC_C":
-                    mc_c += 3
-                elif f_state == "MC_CL":
-                    mc_cl += 3
-
-            pre_upgrade_per_link_writer.writerow([
-                int(cycle_idx),
-                float(time_day),
-                int(link_id),
-                sc_c,
-                sc_cl,
-                mc_c,
-                mc_cl,
-            ])
+    def _sync_from_state():
+        """Re-read locals that a state-based helper (commit_upgrade_plan) may have replaced."""
+        nonlocal total_network_cost, working_topology, link_status_forward, link_status_backward
+        nonlocal removed_links_info, ALL_DEMANDS, PATHS, link_execution_queue, per_link_jobs
+        total_network_cost = state["total_network_cost"]
+        working_topology = state["working_topology"]
+        link_status_forward = state["link_status_forward"]
+        link_status_backward = state["link_status_backward"]
+        removed_links_info = state["removed_links_info"]
+        ALL_DEMANDS = state["ALL_DEMANDS"]
+        PATHS = state["PATHS"]
+        link_execution_queue = state["link_execution_queue"]
+        per_link_jobs = state["per_link_jobs"]
 
     # --- 3. UNROLLED SINGLE CYCLE EVENT EXECUTION ---
     # Weekly traffic growth
@@ -1038,16 +2515,50 @@ def run_single_cycle(state: Dict[str, Any], action: Optional[Any] = None) -> Tup
     if (Current_global_time // Upgrade_initiation_days) > current_upgrade:
         print(f"\n=== Upgrade cycle triggered at day {Current_global_time} ===")
         current_upgrade += 1
+        ##############################################################################
+        # ### ML-INTEGRATION CHANGE M9 (Claude) ###
+        # CHANGED upgrade check:
+        # - ml_mode='off': algorithm.check_need_for_upgrade(...) exactly as before
+        # - ML modes: XGBoost gatekeeper on the RAW feature row decides upgrade_needed
+        ##############################################################################
+        ml_mode = get_ml_mode(config)
 
         print(">>> Checking whether upgrade is needed...")
-        upgrade_needed = algorithm.check_need_for_upgrade(        
-            current_traffic=traffic_rates,
-            current_time=Current_global_time,
-            PATHS=PATHS,
-            current_link_status_forward=copy.deepcopy(link_status_forward),
-            current_link_status_backward=copy.deepcopy(link_status_backward),
-            seed=seed
-        )
+        gatekeeper_prob = None
+        gatekeeper_overridden = False                      # M16/M17 year-end override
+        if ml_mode == "off":
+            upgrade_needed = algorithm.check_need_for_upgrade(
+                current_traffic=traffic_rates,
+                current_time=Current_global_time,
+                PATHS=PATHS,
+                current_link_status_forward=copy.deepcopy(link_status_forward),
+                current_link_status_backward=copy.deepcopy(link_status_backward),
+                seed=seed
+            )
+        else:
+            # XGBoost gatekeeper on the RAW feature row (same scale as its training CSV)
+            feature_row = build_feature_row(
+                current_bbp=metrics.get_blocking_probability(),
+                traffic_rates=traffic_rates,
+                link_status_forward=link_status_forward,
+                link_ids=state["drl_link_ids"],
+            )
+            upgrade_needed, gatekeeper_prob = gatekeeper_predict(
+                state["gatekeeper"], feature_row,
+                threshold=float(config.get("ml_gatekeeper_threshold", 0.5)),
+            )
+            print(f">>> Gatekeeper P(upgrade) = {gatekeeper_prob:.4f}")
+
+            # M16: optional "use it or lose it" in the last cycle of the budget year
+            if (not upgrade_needed
+                    and config.get("ml_year_end_override_gatekeeper", False)
+                    and is_last_cycle_of_budget_year(Current_global_time)):
+                _sync_to_state()
+                left = remaining_budget_snapshot(state)
+                if min(left["capex"], left["total"]) > 0:
+                    print(">>> Last cycle of the budget year with budget left -> DRL decides anyway")
+                    upgrade_needed = True
+                    gatekeeper_overridden = True
 
         print(f">>> Upgrade needed = {upgrade_needed}")
 
@@ -1071,231 +2582,49 @@ def run_single_cycle(state: Dict[str, Any], action: Optional[Any] = None) -> Tup
             metrics.sd_arrivals.clear()
             metrics.sd_blocked.clear()
 
-            plan_ok = False
-            final_links = []
-            final_upgrade_decisions = {}
-
-            if action is not None and config.get("algorithm") == "drl":
-                safe_links, upgrade_decisions = action
-                plan_ok, final_links, final_upgrade_decisions = plan_checker(
-                    safe_links=safe_links,
-                    upgrade_decisions=upgrade_decisions,
-                    current_time=Current_global_time,
-                    PATHS=PATHS,
-                    current_traffic=traffic_rates,
-                    current_link_status_forward=copy.deepcopy(link_status_forward),
-                    current_link_status_backward=copy.deepcopy(link_status_backward),
-                    seed=seed,
-                    algorithm=algorithm,
-                    budget_params=budget_params,
-                    budget_selection_mode=config.get("budget_selection_mode", "budget_aware"),
-                    budget_tracker=budget_tracker,
-                )
+            ##############################################################################
+            # ### ML-INTEGRATION CHANGE M9 (Claude) ###
+            # ADDED (ML modes): candidate links from main.py's own link selection, then a
+            # DRL decision point is stored in state['pending_drl_decision'].
+            # If there are no candidate links, nothing is upgraded this cycle.
+            # REMOVED: the old `config['algorithm'] == 'drl'` branch.
+            ##############################################################################
+            if ml_mode != "off":
+                # Candidate links come from main.py's hard-coded selection (same as heuristics).
+                _sync_to_state()
+                candidates = drl_candidate_links(state, sd_last_block_prob)
+                if candidates:
+                    # DRL decision point. The caller (run_simulation in deploy mode, or the
+                    # Gym env in DRL_code.py) must call apply_drl_decision(state, action)
+                    # before the next run_single_cycle call.
+                    state["pending_drl_decision"] = {
+                        "cycle": int(current_upgrade),
+                        "time_day": float(Current_global_time),
+                        "period_index": int(period_index),
+                        "gatekeeper_prob": gatekeeper_prob,
+                        "candidate_links": candidates,
+                        "selected_links": [],        # DRL picks accumulate here (M14)
+                        "gatekeeper_override": gatekeeper_overridden,   # M17
+                        "selected_levels": {},       # link -> upgrade level picked (M15)
+                        "sd_last_block_prob": sd_last_block_prob,
+                    }
+                else:
+                    print(">>> No candidate links from link selection -> no upgrade this cycle")
             else:
-                for path_rank in range(3):
-                    upgrade_links, link_scores, top_contrib = algorithm.select_links_for_upgrade(
-                        traffic_rates=traffic_rates,
-                        PATHS=PATHS,
-                        sd_block_prob=sd_last_block_prob,
-                        block_threshold=PER_SD_BLOCK_THRESHOLD,
-                        working_topology=working_topology,
-                        LINK_INDEX=LINK_INDEX,
-                        link_status_forward=link_status_forward,
-                        link_status_backward=link_status_backward,
-                        current_time=Current_global_time,
-                        path_stats=path_stats,
-                        path_rank=path_rank,
-                        link_selection_mode=config.get("link_selection_mode", "path_congestion"),
-                        link_score_threshold=config.get("link_score_threshold", PER_SD_BLOCK_THRESHOLD),
-                    )
-
-                    if not upgrade_links:
-                        continue
-
-                    safe_links = network_connectivity(upgrade_links, working_topology, LINK_INDEX)
-                    safe_links = sorted(safe_links, key=lambda lid: float(link_scores.get(lid, 0.0)), reverse=True)
-
-                    if config['algorithm'] == 'greedy':
-                        upgrade_decisions = {lid: choose_upgrade_type_greedy_max(lid, link_status_forward, link_status_backward) for lid in safe_links}
-                    elif config['algorithm'] == 'jump_to_max':
-                        upgrade_decisions = {lid: algorithm.get_upgrade_decision(lid, link_status_forward, link_status_backward) for lid in safe_links}
-                    elif config['algorithm'] == 'random':
-                        upgrade_decisions = {lid: algorithm.get_random_upgrade_decision(lid, link_status_forward) for lid in safe_links}
-                    else:
-                        upgrade_decisions = {lid: choose_upgrade_type(lid, link_status_forward, link_status_backward, algorithm) for lid in safe_links}
-
-                    for lid in upgrade_decisions:
-                        if upgrade_decisions[lid] is None:
-                            upgrade_decisions[lid] = []
-                        elif isinstance(upgrade_decisions[lid], dict):
-                            upgrade_decisions[lid] = [upgrade_decisions[lid]]
-
-                    plan_ok, candidate_links, candidate_upgrade_decisions = plan_checker(
-                        safe_links=safe_links,
-                        upgrade_decisions=upgrade_decisions,
-                        current_time=Current_global_time,
-                        PATHS=PATHS,
-                        current_traffic=traffic_rates,
-                        current_link_status_forward=copy.deepcopy(link_status_forward),
-                        current_link_status_backward=copy.deepcopy(link_status_backward),
-                        seed=seed,
-                        algorithm=algorithm,
-                        budget_params=budget_params,
-                        budget_selection_mode=config.get("budget_selection_mode", "budget_aware"),
-                        budget_tracker=budget_tracker,
-                    )
-
-                    if plan_ok:
-                        final_links = candidate_links
-                        final_upgrade_decisions = candidate_upgrade_decisions
-                        break
-
-            if plan_ok:
-                path_stats.clear()
-                safe_links = final_links
-                upgrade_decisions = final_upgrade_decisions
-                flat_final_decisions = flatten_upgrade_decisions(upgrade_decisions)
-
-                log_pre_upgrade_per_link_state(cycle_idx=current_upgrade, time_day=Current_global_time)
-
-                upgrade_decision_history.append({
-                    "cycle": int(current_upgrade),
-                    "time_day": float(Current_global_time),
-                    "blocking_probability": float(metrics.get_blocking_probability()),
-                    "final_decisions": flat_final_decisions,
-                    "cycle_upgrade_level": get_cycle_upgrade_level(flat_final_decisions),
-                })
-
-                upgrade_cycle_writer.writerow([
-                    int(current_upgrade),
-                    float(Current_global_time),
-                    float(metrics.get_blocking_probability()),
-                    len(safe_links),
-                    str(list(safe_links)),
-                    str(flat_final_decisions),
-                    get_cycle_upgrade_level(flat_final_decisions),
-                ])
-                print_upgrade_decisions_summary(Current_global_time, safe_links, upgrade_decisions)
-
-                immediate_actions = {}
-                per_link_jobs = {}
-
-                for lid in safe_links:
-                    decs = upgrade_decisions.get(lid, [])
-                    decs = [decs] if isinstance(decs, dict) else list(decs)
-                    has_core = any(d.get("upgrade_type") == "core_upgrade" for d in decs)
-
-                    immediate_actions[lid] = []
-                    per_link_jobs[lid] = []
-
-                    if has_core:
-                        per_link_jobs[lid] = list(decs)
-                    else:
-                        for dec in decs:
-                            if dec is None or dec.get("upgrade_type") is None:
-                                continue
-                            utype = dec.get("upgrade_type")
-                            if utype == "new_fiber_C":
-                                immediate_actions[lid].append(dec)
-                            else:
-                                per_link_jobs[lid].append(dec)
-
-                immediate_actions = {lid: decs for lid, decs in immediate_actions.items() if decs}
-                per_link_jobs = {lid: decs for lid, decs in per_link_jobs.items() if decs}
-                link_execution_queue = [lid for lid in safe_links if lid in per_link_jobs]
-
-                cycle_actions = {}
-                for lid, decs in immediate_actions.items():
-                    cycle_actions.setdefault(lid, []).extend(decs)
-                for lid, decs in per_link_jobs.items():
-                    cycle_actions.setdefault(lid, []).extend(decs)
-
-                cycle_links = sorted(cycle_actions.keys())
-
-                total_cost_cycle, cost_summary, cost_details = compute_upgrade_costs(
-                    safe_links_for_upgrade=cycle_links,
-                    upgrade_decisions=cycle_actions,
-                    algorithm_name=algorithm.name
+                ##############################################################################
+                # ### ML-INTEGRATION CHANGE M9 (Claude) ###
+                # CHANGED (ml_mode='off'): your path-rank loop and the 'if plan_ok:' block
+                # now live in run_heuristic_upgrade() and commit_upgrade_plan() (M4). The
+                # logic is identical; verified connection-by-connection against your
+                # original main.py on the same seed.
+                ##############################################################################
+                _sync_to_state()
+                plan_ok, final_links, final_upgrade_decisions = run_heuristic_upgrade(
+                    state, config['algorithm'], algorithm, sd_last_block_prob
                 )
-
-                equip = float(cost_summary.get("equipment_total", 0.0))
-                work = float(cost_summary.get("workforce_total", 0.0))
-                capex_work_cycle = equip + work
-                total_network_cost += capex_work_cycle
-
-                day_marker = int(Current_global_time)
-                if not upgrade_cost_timeline or int(upgrade_cost_timeline[-1].get("day", -1)) != day_marker:
-                    upgrade_cost_timeline.append({
-                        "day": float(day_marker),
-                        "equipment": 0.0,
-                        "workforce": 0.0,
-                        "opex": 0.0,
-                        "total": 0.0,
-                        "cumulative_total": float(total_network_cost),
-                    })
-
-                row = upgrade_cost_timeline[-1]
-                row["equipment"] = float(row.get("equipment", 0.0)) + equip
-                row["workforce"] = float(row.get("workforce", 0.0)) + work
-                row["total"] = (
-                    float(row.get("equipment", 0.0))
-                    + float(row.get("workforce", 0.0))
-                    + float(row.get("opex", 0.0))
-                )
-                row["cumulative_total"] = float(total_network_cost)
-
-                if immediate_actions:
-                    immediate_links = sorted(immediate_actions.keys())
-                    for link_id, decs in immediate_actions.items():
-                        for dec in decs:
-                            log_upgrade_action(
-                                upgrade_log_csv,
-                                day=Current_global_time,
-                                period_index=period_index,
-                                scope="immediate",
-                                link_id=link_id,
-                                upgrade_type=dec.get("upgrade_type", ""),
-                                fiber_id=dec.get("fiber_id", None),
-                                core_type=dec.get("core_type", None),
-                            )
-
-                    perform_upgrade(
-                        immediate_links,
-                        immediate_actions,
-                        link_status_forward,
-                        link_status_backward,
-                        C_BAND_SLOTS,
-                        TOTAL_SLOTS,
-                        Current_global_time,
-                        algorithm
-                    )
-
-                (
-                    link_execution_queue,
-                    per_link_jobs,
-                    working_topology,
-                    link_status_forward,
-                    link_status_backward,
-                    removed_links_info,
-                    ALL_DEMANDS,
-                    total_network_cost,
-                    PATHS,
-                ) = start_next_link_job(
-                    link_execution_queue=link_execution_queue,
-                    per_link_jobs=per_link_jobs,
-                    current_time=Current_global_time,
-                    period_index=period_index,
-                    working_topology=working_topology,
-                    link_status_forward=link_status_forward,
-                    link_status_backward=link_status_backward,
-                    removed_links_info=removed_links_info,
-                    ALL_DEMANDS=ALL_DEMANDS,
-                    total_network_cost=total_network_cost,
-                    PATHS=PATHS,
-                    upgrade_log_csv=upgrade_log_csv,               
-                    upgrade_cost_timeline=upgrade_cost_timeline,   
-                    algorithm=algorithm,
-                )
+                if plan_ok:
+                    commit_upgrade_plan(state, final_links, final_upgrade_decisions, period_index)
+                _sync_from_state()
 
     # Restore Downtime Links
     restore_now = [
@@ -1476,17 +2805,28 @@ def run_single_cycle(state: Dict[str, Any], action: Optional[Any] = None) -> Tup
             metrics.sd_blocked[sd_u] += 1
         metrics.record_connection(src, dest, datarate, blocked, Current_global_time)
 
+    ##############################################################################
+    # ### ML-INTEGRATION CHANGE M10 (Claude) ###
+    # BUG FIX: previously only 8 scalars were written back, so link_execution_queue,
+    # per_link_jobs, PATHS (after a downtime restore), working_topology,
+    # removed_links_info, ALL_DEMANDS and link status were lost between calls.
+    # Stop rule now only applies after warmup, like the original single loop.
+    ##############################################################################
     # --- 4. PACK UPDATED STATE BACK ---
-    state["Current_global_time"] = Current_global_time
-    state["current_week"] = current_week
-    state["current_upgrade"] = current_upgrade
-    state["current_month"] = current_month
-    state["last_cost_time"] = last_cost_time
-    state["last_logged_day"] = last_logged_day
-    state["total_network_cost"] = total_network_cost
-    state["connection_id"] = connection_id
+    # ALL reassigned locals are written back (previously only the scalars were, so the
+    # downtime job queue, per-link jobs, restored PATHS, etc. were silently lost).
+    _sync_to_state()
 
-    done = bool(metrics.get_blocking_probability() >= config['blocking_threshold'])
+    # Same stop rule as the original single-loop simulator: only checked after warmup.
+    done = bool(
+        connection_id > config['warmup_connections']
+        and metrics.get_blocking_probability() >= config['blocking_threshold']
+    )
+    if done:
+        print(
+            f"\nSimulation stopped: blocking threshold "
+            f"({config['blocking_threshold']}) reached at day {Current_global_time:.1f}."
+        )
     reward = -float(metrics.get_blocking_probability())
 
     return state, reward, done
@@ -1495,13 +2835,51 @@ def run_simulation(config: Dict[str, Any]):
     """
     Run the optical network simulation with given configuration using the modular loop.
     """
+    ##############################################################################
+    # ### ML-INTEGRATION CHANGE M11 (Claude) ###
+    # ADDED: ml_mode='train' is driven by DRL_code.py; deploy loads the policy
+    # up front so a missing file fails fast.
+    ##############################################################################
+    ml_mode = get_ml_mode(config)
+    if ml_mode == "train":
+        raise RuntimeError(
+            "ml_mode='train' makes main.py the backend for DRL_code.py. "
+            "Run DRL_code.py to train, or set ml_mode to 'off' or 'deploy'."
+        )
+
+    # Load the DRL policy before building the state, so a missing file fails fast.
+    drl_policy = load_drl_policy(config["ml_drl_policy_path"]) if ml_mode == "deploy" else None
+
     # 1. Initialize simulation state
     state = initialize_simulation_state(config)
+    ##############################################################################
+    # ### ML-INTEGRATION CHANGE M11 (Claude) ###
+    # BUG FIX: `config` was the raw CONFIG, so config['blocking_csv'] raised a
+    # KeyError at the end of every run.
+    ##############################################################################
+    # Use the EXTENDED config (results_dir, blocking_csv, plot paths, ...) from here on.
+    # The raw CONFIG passed in does not contain those keys.
+    config = state["config"]
     done = False
 
     # 2. Main Event Loop
     while not done:
         state, reward, done = run_single_cycle(state)
+
+        ##############################################################################
+        # ### ML-INTEGRATION CHANGE M11 (Claude) ###
+        # ADDED: deploy-mode decision loop. The DRL keeps picking links until nothing
+        # else fits the budget/downtime; then the whole set goes to plan_checker once
+        # (incremental fallback on FAIL happens inside apply_drl_decision).
+        ##############################################################################
+        # ML deploy: gatekeeper said "upgrade" -> DRL picks links -> plan_checker validates
+        if state.get("pending_drl_decision") is not None:
+            if done:
+                state["pending_drl_decision"] = None
+            else:
+                while state.get("pending_drl_decision") is not None:
+                    action = drl_policy_action(state, drl_policy)
+                    apply_drl_decision(state, action)
 
     # 3. Post-Simulation Results, Plots, and Reporting
     metrics = state["metrics"]
@@ -1578,12 +2956,23 @@ def run_simulation(config: Dict[str, Any]):
     except Exception as e:
         print(f"[WARN] Technology mix plot failed: {e}")
 
-    state["connection_log_file"].close()
-    state["daily_network_file"].close()
-    state["upgrade_cycle_file"].close()
-    state["pre_upgrade_per_link_file"].close()
+    ##############################################################################
+    # ### ML-INTEGRATION CHANGE M12 (Claude) ###
+    # ADDED: save drl_decisions.csv; close_state_files() replaces the four
+    # individual .close() calls; run_simulation now returns the final state.
+    ##############################################################################
+    if state["drl_decision_log"]:
+        drl_log_path = config["results_dir"] / "drl_decisions.csv"
+        with open(drl_log_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(state["drl_decision_log"][0].keys()))
+            writer.writeheader()
+            writer.writerows(state["drl_decision_log"])
+        print(f"✓ Saved DRL decision log to {drl_log_path}")
+
+    close_state_files(state)
 
     print(f"\n✓ All results saved to: {config['results_dir']}")
+    return state
 
 
 # ============================================================================
@@ -2033,9 +3422,13 @@ if __name__ == "__main__":
         CONFIG.get("collect_xgboost_data", False)
         and CONFIG.get("reset_xgboost_csv_before_run", False)
     ):
+        ##############################################################################
+        # ### ML-INTEGRATION CHANGE M13 (Claude) ###
+        # CHANGED: CONFIG['algorithm'] -> get_run_label(CONFIG) (ml_deploy folder in ML modes).
+        ##############################################################################
         results_dir = create_results_directory(
             CONFIG["topology"],
-            CONFIG["algorithm"]
+            get_run_label(CONFIG)
         )
 
         xgb_csv_path = results_dir / CONFIG.get(
@@ -2062,9 +3455,13 @@ if __name__ == "__main__":
             run_config = copy.deepcopy(CONFIG)
             run_config["seed"] = seed_value
 
+            ##############################################################################
+            # ### ML-INTEGRATION CHANGE M13 (Claude) ###
+            # CHANGED: run_config['algorithm'] -> get_run_label(run_config).
+            ##############################################################################
             results_dir = create_results_directory(
                 run_config["topology"],
-                run_config["algorithm"]
+                get_run_label(run_config)
             )
 
             log_file_path = results_dir / f"simulation_log_seed_{seed_value}.txt"
@@ -2098,9 +3495,13 @@ if __name__ == "__main__":
     # Run only one seed
     # ============================================================
     else:
+        ##############################################################################
+        # ### ML-INTEGRATION CHANGE M13 (Claude) ###
+        # CHANGED: CONFIG['algorithm'] -> get_run_label(CONFIG).
+        ##############################################################################
         results_dir = create_results_directory(
             CONFIG["topology"],
-            CONFIG["algorithm"]
+            get_run_label(CONFIG)
         )
 
         log_file_path = results_dir / f"simulation_log_seed_{CONFIG['seed']}.txt"

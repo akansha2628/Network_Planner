@@ -1,3 +1,30 @@
+# ##############################################################################
+# ##############################################################################
+# ###                                                                        ###
+# ###   ML-INTEGRATION CHANGE LOG — gatekeeper.py (changes made by Claude)    ###
+# ###                                                                        ###
+# ###   3 changes, each marked with a box that starts                        ###
+# ###       ### ML-INTEGRATION CHANGE G<number> (Claude) ###                 ###
+# ###   Everything else is your original code, unchanged.                    ###
+# ###                                                                        ###
+# ##############################################################################
+# ##############################################################################
+#
+#  G1  Train/val/test split: the last ~20% of the TRAIN seeds (whole seeds) are
+#      held out as a validation set. Seed lists print as plain ints.
+#  G2  Early stopping now watches that validation set. Before, eval_set's last
+#      entry was the TEST set, so early stopping peeked at test data and the
+#      reported test accuracy was optimistic.
+#  G3  The model JSON is saved next to this script (was: the current working
+#      directory), so main.py can find it reliably.
+#  G4  Rows of a test seed that are mislabelled "train" are dropped from training
+#      (her combined_dataset.csv had 2 such rows for seed 19).
+#
+#  The model still trains on the RAW feature columns of combined_dataset.csv.
+#  main.py's gatekeeper_predict() feeds it the same raw features, matched by
+#  column name (not the normalized DRL vector).
+# ##############################################################################
+
 import sys
 import numpy as np
 import pandas as pd
@@ -64,7 +91,7 @@ def validate_dataset(df, feature_cols, target_col):
 # 2. DATA LOADING & COLUMN IDENTIFICATION
 # =====================================================================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-file_path = os.path.join(SCRIPT_DIR, "no_upgrade_dataset.csv")
+file_path = os.path.join(SCRIPT_DIR, "combined_dataset.csv")
 
 print(f"Loading data from: {file_path}")
 try:
@@ -95,14 +122,43 @@ if not validate_dataset(df, feature_cols, target_col):
 # =====================================================================
 # 4. TRAIN / TEST SPLITTING BY SEED
 # =====================================================================
-train_df = df[df["split"] == "train"]
+##############################################################################
+# ### ML-INTEGRATION CHANGE G1 (Claude) ###
+# Was: train_df = df[df['split'] == 'train'] and X_train/X_test only.
+# Now: train seeds are split into train + validation (whole seeds), test unchanged.
+##############################################################################
+train_full_df = df[df["split"] == "train"]
 test_df = df[df["split"] == "test"]
 
+##############################################################################
+# ### ML-INTEGRATION CHANGE G4 (Claude) ###
+# Guard against test-seed leakage: if a seed has ANY rows marked "test", none of
+# its rows may be used for training/validation (combined_dataset.csv had 2 greedy
+# rows for test seed 19 marked "train").
+##############################################################################
+_test_seeds = set(int(s) for s in test_df["seed"].unique())
+_leaked = train_full_df["seed"].isin(_test_seeds)
+if _leaked.any():
+    print(f"⚠️ Dropping {int(_leaked.sum())} 'train' rows that belong to test seeds "
+          f"{sorted(int(s) for s in train_full_df.loc[_leaked, 'seed'].unique())} (test-seed leakage).")
+    train_full_df = train_full_df[~_leaked]
+
+# Early stopping needs a validation set that is NOT the test set (stopping on the test
+# set leaks it into training and inflates the reported test accuracy). Hold out the
+# last ~20% of the TRAIN seeds (whole seeds, so cycles of one run never straddle sets).
+train_seeds = sorted(int(x) for x in train_full_df["seed"].unique())
+n_val_seeds = max(1, int(round(0.2 * len(train_seeds)))) if len(train_seeds) > 1 else 0
+val_seeds = train_seeds[-n_val_seeds:] if n_val_seeds else []
+train_df = train_full_df[~train_full_df["seed"].isin(val_seeds)]
+val_df = train_full_df[train_full_df["seed"].isin(val_seeds)] if val_seeds else train_full_df
+
 X_train, y_train = train_df[feature_cols], train_df[target_col]
+X_val, y_val = val_df[feature_cols], val_df[target_col]
 X_test, y_test = test_df[feature_cols], test_df[target_col]
 
-print(f"Train Set Shape: {X_train.shape[0]} rows x {X_train.shape[1]} features (Seeds 0–14)")
-print(f"Test Set Shape:  {X_test.shape[0]} rows x {X_test.shape[1]} features (Seeds 15–19)\n")
+print(f"Train Set Shape: {X_train.shape[0]} rows x {X_train.shape[1]} features (seeds {sorted(int(x) for x in train_df['seed'].unique())})")
+print(f"Val Set Shape:   {X_val.shape[0]} rows (seeds {val_seeds}) — used only for early stopping")
+print(f"Test Set Shape:  {X_test.shape[0]} rows x {X_test.shape[1]} features (seeds {sorted(int(x) for x in test_df['seed'].unique())})\n")
 
 num_zeros = (y_train == 0).sum()
 num_ones = (y_train == 1).sum()
@@ -130,7 +186,11 @@ print("Starting XGBoost Model Training...")
 model.fit(
     X_train,
     y_train,
-    eval_set=[(X_train, y_train), (X_test, y_test)],
+    ##############################################################################
+    # ### ML-INTEGRATION CHANGE G2 (Claude) ###
+    # Was: eval_set=[(X_train, y_train), (X_test, y_test)] -> early stopping on TEST data.
+    ##############################################################################
+    eval_set=[(X_train, y_train), (X_val, y_val)],   # last set drives early stopping
     verbose=20
 )
 print("Training completed!\n")
@@ -186,7 +246,11 @@ for rank, (feat_name, score) in enumerate(top_15_features.items(), 1):
 # =====================================================================
 # 8. SAVE MODEL FOR SIMULATOR INTEGRATION
 # =====================================================================
-output_model_name = "xgboost_gatekeeper_model.json"
+##############################################################################
+# ### ML-INTEGRATION CHANGE G3 (Claude) ###
+# Was: output_model_name = 'xgboost_gatekeeper_model.json' (saved to the cwd).
+##############################################################################
+output_model_name = os.path.join(SCRIPT_DIR, "xgboost_gatekeeper_model.json")
 model.save_model(output_model_name)
 print("\n" + "=" * 60)
 print(f"✅ Model exported successfully as '{output_model_name}'!")
