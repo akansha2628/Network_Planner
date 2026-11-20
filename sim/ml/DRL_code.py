@@ -23,6 +23,7 @@ downtime limit and keep the network connected.
 Usage (run from the repository root or from sim/ml)
 -----
     python sim/ml/DRL_code.py --check                      # quick smoke test (no training)
+    python sim/ml/DRL_code.py --n-envs 4 --max-cycles 4 --time-limit-minutes 60   # timing test
     python sim/ml/DRL_code.py --timesteps 50000 --n-envs 4 # train with 4 simulators in parallel
     python sim/ml/DRL_code.py --resume sim/ml/drl_optical_policy.zip --timesteps 20000
     python sim/ml/DRL_code.py --evaluate sim/ml/drl_optical_policy.zip   # vs random + incremental
@@ -119,6 +120,27 @@ Usage (run from the repository root or from sim/ml)
 #        Use it on checkpoints to decide whether training is worth continuing.
 #  D18 --seed (default 0) makes training reproducible. Give each machine /
 #      independent run a different seed.
+#  D19 FIRST-RUN FIXES (after Akansha's first run on real packages):
+#      - --n-steps (default 32): PPO learns after every n_steps x n_envs steps.
+#        The old fixed 256 meant 256 x 7 = 1,792 steps before the FIRST update,
+#        which takes days once the simulated network is older. --batch-size is
+#        picked automatically to divide the rollout evenly.
+#      - --max-cycles N: each training episode stops just before upgrade cycle
+#        N+1 starts (main.py's M21 limit, so training, main.py and --evaluate
+#        all cut at the same point). It counts as truncated, not as the end of
+#        the lifetime, so there is no terminal penalty. Episodes finish, curves
+#        appear, and early training uses the fast early years. Raise it over
+#        time (e.g. 4 -> 8 -> no limit) with --resume.
+#      - Progress line every --progress-minutes (default 10): steps, steps/hour,
+#        learning updates so far and steps until the next one, episodes finished.
+#      - --time-limit-minutes N: stop cleanly (and save) after N minutes. Used
+#        for the timing test and for overnight runs.
+#      - Curves: a third panel with BBP at episode end; the lifetime panel says
+#        when episodes were cut off by --max-cycles (Monitor logs lifetime_ended).
+#      - --evaluate: --eval-max-cycles N, and "lifetime_reached_threshold" is now
+#        False for runs stopped by a day or cycle cap.
+#      - Old monitor / validation CSVs with the previous columns are renamed
+#        (*.pre_D19) instead of being appended to with mismatched columns.
 # ##############################################################################
 
 import sys
@@ -205,7 +227,8 @@ class OpticalNetworkEnv(gym.Env):
         train_seeds=TRAIN_SEEDS,             # D17: 0-11 (validation 12-14, test 15-19)
         quiet=True,                          # silence simulator prints during training
         run_tag=None,                        # D17: own results folder per parallel simulator
-        max_decisions_per_episode=None,      # optional truncation
+        max_decisions_per_episode=None,      # optional truncation (counts DRL decisions)
+        max_cycles=None,                     # D19: stop the episode after upgrade cycle N
         terminal_penalty=-10000.0,
         action_cost_penalty=5.0,
         invalid_action_penalty=-100.0,       # DRL's selection failed plan_checker (cycle falls back to incremental)
@@ -213,6 +236,10 @@ class OpticalNetworkEnv(gym.Env):
         super().__init__()
         self.sim_config = copy.deepcopy(sim_config)
         self.sim_config["ml_mode"] = "train"
+        # D19: the cycle limit uses main.py's own limit (M21), so a training episode stops
+        # exactly where main.py and --evaluate stop: just before cycle N+1 starts. The env
+        # reports that as TRUNCATED (no terminal penalty), not as the end of the lifetime.
+        self.sim_config["max_upgrade_cycles_for_debug"] = int(max_cycles) if max_cycles else None
         if run_tag:
             self.sim_config["ml_run_tag"] = str(run_tag)
         self.train_seeds = tuple(int(s) for s in train_seeds)
@@ -220,6 +247,7 @@ class OpticalNetworkEnv(gym.Env):
             raise ValueError("train_seeds must not be empty")
         self.quiet = quiet
         self.max_decisions_per_episode = max_decisions_per_episode
+        self.max_cycles = int(max_cycles) if max_cycles else None
         self.terminal_penalty = float(terminal_penalty)
         self.action_cost_penalty = float(action_cost_penalty)
         self.invalid_action_penalty = float(invalid_action_penalty)
@@ -276,14 +304,17 @@ class OpticalNetworkEnv(gym.Env):
     ##############################################################################
     def _advance_to_decision(self):
         """Run connection events until a DRL decision with a real choice is pending, or the
-        lifetime ends. Returns True if the episode terminated (BBP threshold reached).
+        lifetime ends. Returns True if the episode ended: either the BBP threshold was reached
+        (self._cut_by_cycle_limit False) or the --max-cycles limit was hit (True, D19).
         Decision points where no candidate link is feasible are resolved automatically
         (STOP -> incremental fallback) because the agent has nothing to choose."""
+        self._cut_by_cycle_limit = False
         with self._sim():
             while True:
                 self.sim_state, _, done = run_single_cycle(self.sim_state)
                 if done:
                     self.sim_state["pending_drl_decision"] = None
+                    self._cut_by_cycle_limit = bool(self.sim_state.get("stopped_by_cycle_limit"))
                     return True
                 if self.sim_state.get("pending_drl_decision") is not None:
                     mask = compute_drl_action_mask(self.sim_state)
@@ -346,15 +377,17 @@ class OpticalNetworkEnv(gym.Env):
         for sim_seed in seed_order:
             self.sim_state = self._new_sim_state(sim_seed)
             self.decisions_this_episode = 0
-            terminated = self._advance_to_decision()
-            if not terminated:
+            ended = self._advance_to_decision()
+            if not ended:
                 return self._observe(), {"sim_seed": sim_seed, "bbp": self._bbp(),
                                          "day": float(self.sim_state["Current_global_time"])}
             close_state_files(self.sim_state)
 
         raise RuntimeError(
-            "The network reached its BBP threshold before any upgrade decision point for every "
-            "training seed. Check Upgrade_initiation_days / the gatekeeper threshold."
+            "No upgrade decision point was reached for any training seed (the network hit its BBP "
+            "threshold, or the --max-cycles limit came first because the gatekeeper said 'no' "
+            "every cycle). Try a larger --max-cycles, or check Upgrade_initiation_days / the "
+            "gatekeeper threshold."
         )
 
     ##############################################################################
@@ -380,11 +413,14 @@ class OpticalNetworkEnv(gym.Env):
             info = {"bbp": self._bbp(), "day": float(self.sim_state["Current_global_time"]),
                     "cycle_complete": False, "selected_links": result["selected_links"],
                     "selected_levels": result["selected_levels"],
-                    "status": "picking", "fallback": None, "final_links": []}
+                    "status": "picking", "fallback": None, "final_links": [],
+                    "lifetime_ended": False}
             return self._observe(), 0.0, False, False, info
 
         self.decisions_this_episode += 1
-        terminated = self._advance_to_decision()
+        ended = self._advance_to_decision()
+        cut = ended and self._cut_by_cycle_limit           # D19: --max-cycles reached
+        terminated = ended and not cut                       # real end of the network's lifetime
         bbp = self._bbp()
         reward = self._calculate_reward(bbp, result, terminated)
 
@@ -393,6 +429,7 @@ class OpticalNetworkEnv(gym.Env):
             and self.max_decisions_per_episode is not None
             and self.decisions_this_episode >= self.max_decisions_per_episode
         )
+        truncated = truncated or cut                         # D19
         info = {
             "bbp": bbp,
             "day": float(self.sim_state["Current_global_time"]),
@@ -402,6 +439,7 @@ class OpticalNetworkEnv(gym.Env):
             "status": result["status"],
             "fallback": result["fallback"],
             "final_links": result["final_links"],
+            "lifetime_ended": bool(terminated),        # D19: False when cut off by --max-cycles
         }
         return self._observe(), float(reward), terminated, truncated, info
 
@@ -489,7 +527,10 @@ def _read_monitor_logs(log_dir):
             t_start = float(json.loads(header.lstrip("#")).get("t_start", 0.0))
         except Exception:
             t_start = 0.0
-        df = pd.read_csv(path, skiprows=1)
+        try:
+            df = pd.read_csv(path, skiprows=1)
+        except Exception:            # D19: empty / half-written file (e.g. a killed run): skip it
+            continue
         if len(df):
             # "t" restarts from 0 when a run is resumed (--resume appends to the same file):
             # make it keep increasing so the file's own order is preserved.
@@ -525,8 +566,17 @@ def plot_training_curves(log_dir):
     # Lifetime is plotted in simulated days (episode length is now number of picks,
     # not connection arrivals).
     results_df['smoothed_lifetime'] = results_df['day'].rolling(window=window_size, min_periods=1).mean()
+    # D19: BBP at episode end, and whether episodes were cut off by --max-cycles.
+    has_bbp = 'bbp' in results_df.columns
+    if has_bbp:
+        results_df['smoothed_bbp'] = results_df['bbp'].rolling(window=window_size, min_periods=1).mean()
+    cut_off = False
+    if 'lifetime_ended' in results_df.columns:
+        ended = results_df['lifetime_ended'].astype(str).str.lower().isin(['true', '1'])
+        cut_off = bool((~ended).any())
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    fig, axes = plt.subplots(3 if has_bbp else 2, 1, figsize=(10, 11 if has_bbp else 8), sharex=True)
+    ax1, ax2 = axes[0], axes[1]
 
     ax1.plot(results_df['timesteps'], results_df['r'], color='lightskyblue', alpha=0.4, label='Raw Episode Reward')
     ax1.plot(results_df['timesteps'], results_df['smoothed_reward'], color='navy', linewidth=2, label='Moving Average Reward')
@@ -537,11 +587,24 @@ def plot_training_curves(log_dir):
 
     ax2.plot(results_df['timesteps'], results_df['day'], color='lightgreen', alpha=0.4, label='Raw Network Lifetime')
     ax2.plot(results_df['timesteps'], results_df['smoothed_lifetime'], color='darkgreen', linewidth=2, label='Moving Average Lifetime')
-    ax2.set_title('Network Lifetime (days until BBP crosses threshold)', fontsize=12, fontweight='bold')
-    ax2.set_xlabel('Total Training Steps (link picks)', fontsize=10)
+    if cut_off:   # D19
+        ax2.set_title('Day at episode end (episodes cut off by --max-cycles, so not full lifetimes)',
+                      fontsize=12, fontweight='bold')
+    else:
+        ax2.set_title('Network Lifetime (days until BBP crosses threshold)', fontsize=12, fontweight='bold')
     ax2.set_ylabel('Lifetime (days)', fontsize=10)
+    ax2.ticklabel_format(axis='y', useOffset=False, style='plain')   # D19: no '+5.4e2' offset
     ax2.grid(True, linestyle='--', alpha=0.6)
     ax2.legend(loc='lower right')
+    if has_bbp:   # D19
+        ax3 = axes[2]
+        ax3.plot(results_df['timesteps'], results_df['bbp'], color='navajowhite', alpha=0.6, label='Raw BBP at episode end')
+        ax3.plot(results_df['timesteps'], results_df['smoothed_bbp'], color='darkorange', linewidth=2, label='Moving Average BBP')
+        ax3.set_title('Blocking probability at episode end (lower is better)', fontsize=12, fontweight='bold')
+        ax3.set_ylabel('BBP', fontsize=10)
+        ax3.grid(True, linestyle='--', alpha=0.6)
+        ax3.legend(loc='upper right')
+    axes[-1].set_xlabel('Total Training Steps (link picks)', fontsize=10)
 
     plt.tight_layout()
     plot_output_path = os.path.join(log_dir, "drl_training_curves.png")
@@ -550,36 +613,90 @@ def plot_training_curves(log_dir):
     return plot_output_path
 
 
-def make_checkpoint_callback(save_every, checkpoint_dir, latest_model_path, log_dir):
+def make_checkpoint_callback(save_every, checkpoint_dir, latest_model_path, log_dir,
+                             progress_minutes=10.0, time_limit_minutes=None, steps_per_update=None):
     """
     Every `save_every` training steps:
       - saves drl_logs/checkpoints/drl_policy_<steps>_steps.zip   (history)
       - overwrites the main policy zip (latest_model_path)          (always usable by main.py)
       - refreshes drl_training_curves.png                           (watch for the plateau)
+    D19: also prints a progress line every `progress_minutes` and stops training cleanly
+    once `time_limit_minutes` have passed (the caller then saves the model).
     """
+    import time
     from stable_baselines3.common.callbacks import BaseCallback
+
+    def _hms(sec):
+        sec = int(sec)
+        return f"{sec // 3600}h{(sec % 3600) // 60:02d}m{sec % 60:02d}s"
 
     class CheckpointAndPlotCallback(BaseCallback):
         def __init__(self):
             super().__init__(verbose=0)
             self._last_save = None      # set on the first step (works for fresh and resumed runs)
+            self._t0 = None             # D19 progress bookkeeping
+            self._start_steps = 0
+            self._last_report_t = None
+            self._last_report_steps = 0
+            self._episodes = 0
+
+        def _progress(self, final=False):
+            now = time.time()
+            run_steps = self.num_timesteps - self._start_steps
+            elapsed = max(now - self._t0, 1e-9)
+            recent = max(now - self._last_report_t, 1e-9)
+            rate_all = run_steps / elapsed * 3600.0
+            rate_recent = (self.num_timesteps - self._last_report_steps) / recent * 3600.0
+            rates = (f"{rate_all:,.0f} steps/h overall" if final else
+                     f"{rate_recent:,.0f} steps/h recently, {rate_all:,.0f} steps/h overall")
+            line = (f"[progress{' - final' if final else ''}] {_hms(elapsed)} | "
+                    f"{self.num_timesteps} steps total ({run_steps} this run) | {rates} | "
+                    f"episodes finished: {self._episodes}")
+            if steps_per_update:
+                done_updates = run_steps // steps_per_update
+                to_next = steps_per_update - (run_steps % steps_per_update)
+                line += f" | learning updates: {done_updates} (next after {to_next} more steps)"
+            print(line, flush=True)
+            self._last_report_t, self._last_report_steps = now, self.num_timesteps
 
         def _save(self):
             os.makedirs(checkpoint_dir, exist_ok=True)
             ckpt = os.path.join(checkpoint_dir, f"drl_policy_{self.num_timesteps}_steps.zip")
             self.model.save(ckpt)
             self.model.save(latest_model_path)
-            plot = plot_training_curves(log_dir)
+            try:                     # D19: a plotting problem must never stop training
+                plot = plot_training_curves(log_dir)
+            except Exception as e:
+                plot = None
+                print(f"⚠️ Could not refresh the training curves ({e}); training continues.")
             print(f"💾 Checkpoint at {self.num_timesteps} steps -> {ckpt} "
                   f"(also {latest_model_path}){' | curves updated' if plot else ''}")
 
         def _on_step(self) -> bool:
             if self._last_save is None:
                 self._last_save = self.num_timesteps - 1
+            if self._t0 is None:                                   # D19
+                self._t0 = self._last_report_t = time.time()
+                n_envs_now = int(getattr(self.model, "n_envs", 1) or 1)
+                self._start_steps = self._last_report_steps = self.num_timesteps - n_envs_now
+            dones = self.locals.get("dones") if isinstance(self.locals, dict) else None
+            if dones is not None:
+                self._episodes += int(np.sum(dones))
             if self.num_timesteps - self._last_save >= save_every:
                 self._last_save = self.num_timesteps
                 self._save()
+            now = time.time()
+            if progress_minutes and now - self._last_report_t >= 60.0 * progress_minutes:
+                self._progress()
+            if time_limit_minutes and now - self._t0 >= 60.0 * time_limit_minutes:
+                print(f"⏱ Time limit of {time_limit_minutes} min reached: stopping training "
+                      f"(the model is saved next).", flush=True)
+                return False
             return True
+
+        def _on_training_end(self) -> None:                        # D19
+            if self._t0 is not None:
+                self._progress(final=True)
 
     return CheckpointAndPlotCallback()
 
@@ -598,28 +715,55 @@ def _mask_fn(env):
     return env.action_masks()
 
 
-def make_training_env(rank, quiet, log_dir, override_existing, n_envs):
+MONITOR_KEYWORDS = ("bbp", "day", "lifetime_ended")       # D19: + lifetime_ended
+
+
+def _set_aside_if_columns_differ(path, expected_columns):
+    """D19: a CSV written by an older version has different columns; appending to it
+    would corrupt it. Rename it to <name>.pre_D19 (kept, but no longer read) instead."""
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path) as f:
+            first = f.readline()
+            header = f.readline() if first.startswith("#") else first
+        columns = [c.strip() for c in header.strip().split(",")]
+    except Exception:
+        columns = []
+    if columns != list(expected_columns):
+        old = path + ".pre_D19"
+        if os.path.exists(old):
+            os.remove(old)
+        os.replace(path, old)
+        print(f"Note: {os.path.basename(path)} had older columns; kept as {os.path.basename(old)}.")
+
+
+def make_training_env(rank, quiet, log_dir, override_existing, n_envs, max_cycles=None):
     """One training simulator: OpticalNetworkEnv -> ActionMasker -> Monitor (top level so it
     can be sent to worker processes)."""
     from stable_baselines3.common.monitor import Monitor
     from sb3_contrib.common.wrappers import ActionMasker
     env = OpticalNetworkEnv(sim_config=CONFIG, quiet=quiet,
-                            run_tag=(f"train_env{rank}" if n_envs > 1 else None))
+                            run_tag=(f"train_env{rank}" if n_envs > 1 else None),
+                            max_cycles=max_cycles)                      # D19
     env = ActionMasker(env, _mask_fn)
     monitor_path = (os.path.join(log_dir, "monitor.csv") if n_envs == 1
                     else os.path.join(log_dir, f"env{rank}.monitor.csv"))
+    if not override_existing:                                           # D19
+        _set_aside_if_columns_differ(monitor_path, ("r", "l", "t") + MONITOR_KEYWORDS)
     # Append when resuming, but a log that does not exist yet must be created with its header.
     override_existing = override_existing or not os.path.exists(monitor_path)
-    return Monitor(env, monitor_path, info_keywords=("bbp", "day"),
+    return Monitor(env, monitor_path, info_keywords=MONITOR_KEYWORDS,
                    override_existing=override_existing)
 
 
 def _evaluate_one(job):
     """Run ONE full network lifetime for (method, seed). method: 'drl' | 'random' | 'incremental'."""
-    method, seed, policy_path, max_days, quiet = job
+    method, seed, policy_path, max_days, max_cycles, quiet = job
     import time
     cfg = copy.deepcopy(CONFIG)
     cfg.update(seed=int(seed), collect_xgboost_data=False, ml_run_tag=f"eval_{method}_s{seed}")
+    cfg["max_upgrade_cycles_for_debug"] = int(max_cycles) if max_cycles else None   # D19 (main.py M21)
     if method == "incremental":
         cfg.update(ml_mode="off", algorithm="increment")
     else:
@@ -655,7 +799,9 @@ def _evaluate_one(job):
     devnull.close()
     return {
         "method": method, "seed": int(seed), "max_days": max_days or "",
-        "lifetime_reached_threshold": bool(done),
+        "max_cycles": max_cycles or "",                                    # D19
+        # D19: a run stopped by --eval-max-cycles also returns done=True; that is not a lifetime end.
+        "lifetime_reached_threshold": bool(done) and not st.get("stopped_by_cycle_limit", False),
         "days_simulated": round(float(st["Current_global_time"]), 1),
         "final_bbp": round(float(st["metrics"].get_blocking_probability()), 6),
         "total_cost": round(float(st["total_network_cost"]), 2),
@@ -664,24 +810,32 @@ def _evaluate_one(job):
     }
 
 
-def run_evaluation(policy_path, seeds, max_days, workers, log_dir, quiet=True):
+EVAL_FIELDS = ["method", "seed", "max_days", "max_cycles", "lifetime_reached_threshold",
+               "days_simulated", "final_bbp", "total_cost", "upgrades_committed", "wall_seconds"]
+
+
+def run_evaluation(policy_path, seeds, max_days, workers, log_dir, quiet=True, max_cycles=None):
     """Policy vs random vs incremental on `seeds`; writes CSVs and prints a summary table."""
     import csv, time
     import multiprocessing as mp
     os.makedirs(log_dir, exist_ok=True)
     base_file = os.path.join(log_dir, "validation_baselines.csv")
     res_file = os.path.join(log_dir, "validation_results.csv")
-    key = lambda r: (r["method"], int(r["seed"]), str(r["max_days"]))
+    # D19: CSVs from the previous version have no max_cycles column -> set them aside.
+    _set_aside_if_columns_differ(base_file, EVAL_FIELDS)
+    _set_aside_if_columns_differ(res_file, ["evaluated_at", "policy"] + EVAL_FIELDS)
+    caps = (str(max_days or ""), str(max_cycles or ""))
+    key = lambda r: (r["method"], int(r["seed"]), str(r["max_days"]), str(r["max_cycles"]))
 
     cached = {}
     if os.path.exists(base_file):
         with open(base_file, newline="") as f:
             for r in csv.DictReader(f):
                 cached[key(r)] = r
-    jobs = [("drl", s, policy_path, max_days, quiet) for s in seeds]
+    jobs = [("drl", s, policy_path, max_days, max_cycles, quiet) for s in seeds]
     for m in ("incremental", "random"):
-        jobs += [(m, s, None, max_days, quiet) for s in seeds
-                 if (m, int(s), str(max_days or "")) not in cached]
+        jobs += [(m, s, None, max_days, max_cycles, quiet) for s in seeds
+                 if (m, int(s)) + caps not in cached]
 
     workers = max(1, min(workers or os.cpu_count() or 1, len(jobs)))
     print(f"Evaluating on seeds {list(seeds)}: {len(jobs)} simulations on {workers} worker(s) "
@@ -692,7 +846,7 @@ def run_evaluation(policy_path, seeds, max_days, workers, log_dir, quiet=True):
         with mp.get_context("spawn").Pool(workers) as pool:
             results = pool.map(_evaluate_one, jobs)
 
-    fields = list(results[0].keys())
+    fields = EVAL_FIELDS
     new_base = [r for r in results if r["method"] != "drl"]
     if new_base:
         exists = os.path.exists(base_file)
@@ -702,8 +856,8 @@ def run_evaluation(policy_path, seeds, max_days, workers, log_dir, quiet=True):
                 w.writeheader()
             w.writerows(new_base)
     rows = [r for r in results if r["method"] == "drl"] + [
-        cached[(m, int(s), str(max_days or ""))] for m in ("incremental", "random") for s in seeds
-        if (m, int(s), str(max_days or "")) in cached] + new_base
+        cached[(m, int(s)) + caps] for m in ("incremental", "random") for s in seeds
+        if (m, int(s)) + caps in cached] + new_base
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     exists = os.path.exists(res_file)
     with open(res_file, "a", newline="") as f:
@@ -719,8 +873,8 @@ def run_evaluation(policy_path, seeds, max_days, workers, log_dir, quiet=True):
             r = next(x for x in rows if x["method"] == m and int(x["seed"]) == int(s))
             print(f"{int(s):>5} | {m:<12} | {float(r['days_simulated']):>8.0f} | {str(r['lifetime_reached_threshold']):>13} | "
                   f"{float(r['final_bbp']):>9.4f} | {float(r['total_cost']):>14,.0f}")
-    print("(If a run did not hit the lifetime threshold, it was cut off by --eval-max-days: "
-          "compare final BBP and cost at the same day instead of lifetime.)")
+    print("(If a run did not hit the lifetime threshold, it was cut off by --eval-max-days or "
+          "--eval-max-cycles: compare final BBP and cost at the same point instead of lifetime.)")
     print(f"Saved: {res_file}")
     return rows
 
@@ -773,12 +927,33 @@ if __name__ == "__main__":
     ##############################################################################
     parser.add_argument("--seed", type=int, default=0,
                         help="random seed for training (use a different one for each independent run)")
+    ##############################################################################
+    # ### ML-INTEGRATION CHANGE D19 (Claude) ###
+    # NEW: options that make the first training runs practical (see the D19 log above).
+    ##############################################################################
+    parser.add_argument("--n-steps", type=int, default=None,
+                        help="steps per simulator between learning updates (default 32 for a new run; "
+                             "a resumed run keeps its saved value unless you pass this)")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="PPO minibatch size (default: chosen to divide n_steps x n_envs evenly)")
+    parser.add_argument("--max-cycles", type=int, default=None,
+                        help="end each training episode after upgrade cycle N (default: full lifetime)")
+    parser.add_argument("--progress-minutes", type=float, default=10.0,
+                        help="print a progress line every N minutes (0 = off)")
+    parser.add_argument("--time-limit-minutes", type=float, default=None,
+                        help="stop training cleanly and save after N minutes")
+    parser.add_argument("--eval-max-cycles", type=int, default=None,
+                        help="with --evaluate: stop each run after upgrade cycle N")
     args = parser.parse_args()
+    for _name in ("n_steps", "batch_size", "max_cycles", "eval_max_cycles"):
+        _v = getattr(args, _name)
+        if _v is not None and _v < 1:
+            parser.error(f"--{_name.replace('_', '-')} must be at least 1")
 
     if args.evaluate:
         run_evaluation(args.evaluate, [int(s) for s in args.val_seeds.split(",") if s.strip()],
                        args.eval_max_days, args.eval_workers, str(_THIS_DIR / "drl_logs"),
-                       quiet=not args.verbose_sim)
+                       quiet=not args.verbose_sim, max_cycles=args.eval_max_cycles)
         sys.exit(0)
 
     from stable_baselines3.common.vec_env import SubprocVecEnv
@@ -818,12 +993,27 @@ if __name__ == "__main__":
     n_envs = max(1, int(args.n_envs))
     quiet = not args.verbose_sim
     if n_envs == 1:
-        env = make_training_env(0, quiet, log_dir, args.resume is None, 1)
+        env = make_training_env(0, quiet, log_dir, args.resume is None, 1, args.max_cycles)
     else:
         env = SubprocVecEnv([functools.partial(make_training_env, rank, quiet, log_dir,
-                                               args.resume is None, n_envs)
+                                               args.resume is None, n_envs, args.max_cycles)
                              for rank in range(n_envs)])
         print(f"Training with {n_envs} parallel simulators.")
+    if args.max_cycles:
+        print(f"Episodes end after upgrade cycle {args.max_cycles} (--max-cycles).")
+
+    ##############################################################################
+    # ### ML-INTEGRATION CHANGE D19 (Claude) ###
+    # PPO learns once every n_steps x n_envs steps. Pick a minibatch size that divides
+    # that rollout evenly (about 64), so no data is dropped and SB3 does not warn.
+    ##############################################################################
+    def _pick_batch(buffer_size, wanted=None):
+        if wanted:
+            return max(2, min(int(wanted), buffer_size))
+        n_batches = max(1, round(buffer_size / 64))
+        while buffer_size % n_batches:
+            n_batches += 1
+        return max(2, buffer_size // n_batches)
 
     ##############################################################################
     # ### ML-INTEGRATION CHANGE D12 (Claude) ###
@@ -832,11 +1022,23 @@ if __name__ == "__main__":
     ##############################################################################
     if args.resume:
         print(f"Resuming from {args.resume}")
-        model = MaskablePPO.load(args.resume, env=env, device="cpu")
+        custom = None
+        if args.n_steps is not None or args.batch_size is not None:      # D19: change rollout size on resume
+            from sb3_contrib import MaskablePPO as _PPO
+            saved = _PPO.load(args.resume, device="cpu")
+            n_steps = args.n_steps or int(saved.n_steps)
+            del saved
+            custom = {"n_steps": n_steps, "batch_size": _pick_batch(n_steps * n_envs, args.batch_size)}
+        model = MaskablePPO.load(args.resume, env=env, device="cpu", custom_objects=custom)
         model.set_random_seed(args.seed + int(model.num_timesteps))   # D18: new stream, still reproducible
     else:
+        n_steps = args.n_steps or 32                                    # D19: was a fixed 256
         model = MaskablePPO("MlpPolicy", env, verbose=1, learning_rate=3e-4, gamma=0.99,
-                            n_steps=256, batch_size=64, seed=args.seed)   # D18: seed
+                            n_steps=n_steps, batch_size=_pick_batch(n_steps * n_envs, args.batch_size),
+                            seed=args.seed)   # D18: seed
+    steps_per_update = int(model.n_steps) * n_envs                     # D19
+    print(f"PPO learns after every {int(model.n_steps)} x {n_envs} = {steps_per_update} steps "
+          f"(minibatch {int(model.batch_size)}).")
 
     ##############################################################################
     # ### ML-INTEGRATION CHANGE D14 (Claude) ###
@@ -844,9 +1046,16 @@ if __name__ == "__main__":
     # The policy zip next to this script is always the latest checkpoint, so you
     # can stop as soon as drl_logs/drl_training_curves.png has plateaued.
     ##############################################################################
-    callback = make_checkpoint_callback(args.save_every, checkpoint_dir, model_path, log_dir)
+    callback = make_checkpoint_callback(args.save_every, checkpoint_dir, model_path, log_dir,
+                                        progress_minutes=args.progress_minutes,
+                                        time_limit_minutes=args.time_limit_minutes,
+                                        steps_per_update=steps_per_update)       # D19
     print(f"Training MaskablePPO for {args.timesteps} steps "
-          f"(checkpoint + curves every {args.save_every}; Ctrl+C to stop and save)...")
+          f"(checkpoint + curves every {args.save_every}; Ctrl+C to stop and save)"
+          f"{f'; stops after {args.time_limit_minutes:g} min' if args.time_limit_minutes else ''}...")
+    if args.timesteps < steps_per_update:
+        print(f"Note: PPO always collects a full rollout first, so at least {steps_per_update} steps "
+              f"will run even though --timesteps is {args.timesteps}.")
     try:
         model.learn(total_timesteps=args.timesteps, callback=callback,
                     reset_num_timesteps=args.resume is None)

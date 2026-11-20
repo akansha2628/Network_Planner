@@ -92,6 +92,13 @@ Configure simulation parameters in the CONFIG dictionary below.
 #      maximum (links with more than 1,000 slots used to all look the same, and
 #      fiber counts were nearly invisible); traffic is on a log scale. XGBoost
 #      input is unchanged (raw features).
+#  M21 WORKING CYCLE LIMIT: CONFIG['max_upgrade_cycles_for_debug'] was never read
+#      by any code. It now works: set it to N and a run stops just before upgrade
+#      cycle N+1 would start (so the N-th cycle's effect is still simulated).
+#      Default changed 5 -> None (= no limit), so normal runs behave exactly as
+#      before. A run stopped this way is marked state['stopped_by_cycle_limit'].
+#      DRL training ignores the CONFIG value: DRL_code.py --max-cycles sets the
+#      limit for each training episode instead (D19).
 #
 #  Decision flow in ML modes:
 #    XGBoost: upgrade needed? --no--> nothing this cycle
@@ -395,7 +402,13 @@ CONFIG = {
     'run_multiple_seeds': True,
     'seed_start': 0,
     'seed_end': 0,
-     'max_upgrade_cycles_for_debug': 5,
+    ##############################################################################
+    # ### ML-INTEGRATION CHANGE M21 (Claude) ###
+    # Was: 'max_upgrade_cycles_for_debug': 5 -- but nothing ever read it.
+    # Now it works: None = run the full lifetime (as before); N = stop just before
+    # upgrade cycle N+1 starts. Handy for quick test runs of main.py.
+    ##############################################################################
+    'max_upgrade_cycles_for_debug': None,
 
     # ---------------- Budget envelope settings ----------------
     'budget_enabled': True,
@@ -2512,6 +2525,20 @@ def run_single_cycle(state: Dict[str, Any], action: Optional[Any] = None) -> Tup
     connection_id += 1
 
     # Upgrade Cycle Check (every 3 months)
+    ##############################################################################
+    # ### ML-INTEGRATION CHANGE M21 (Claude) ###
+    # NEW: optional cycle limit. Stop BEFORE cycle N+1 starts (nothing of it runs).
+    ##############################################################################
+    _max_cycles = config.get('max_upgrade_cycles_for_debug')
+    if (_max_cycles is not None
+            and (Current_global_time // Upgrade_initiation_days) > current_upgrade
+            and current_upgrade >= int(_max_cycles)):
+        _sync_to_state()
+        state["stopped_by_cycle_limit"] = True
+        print(f"\nSimulation stopped: cycle limit ({int(_max_cycles)} upgrade cycles) "
+              f"reached at day {Current_global_time:.1f}.")
+        return state, -float(metrics.get_blocking_probability()), True
+
     if (Current_global_time // Upgrade_initiation_days) > current_upgrade:
         print(f"\n=== Upgrade cycle triggered at day {Current_global_time} ===")
         current_upgrade += 1
