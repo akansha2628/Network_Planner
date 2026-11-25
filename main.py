@@ -99,6 +99,26 @@ Configure simulation parameters in the CONFIG dictionary below.
 #      before. A run stopped this way is marked state['stopped_by_cycle_limit'].
 #      DRL training ignores the CONFIG value: DRL_code.py --max-cycles sets the
 #      limit for each training episode instead (D19).
+#  M22 FAIR YEAR-END RULE: 'ml_year_end_override_gatekeeper' default True -> False.
+#      With True, the ML pipeline got an extra chance to spend in the year's last
+#      cycle even when the gatekeeper said "no upgrade"; the heuristics never get
+#      that chance, which tilts the comparison. Now both upgrade only when their
+#      trigger says so. Spending rules are otherwise unchanged and the same as the
+#      heuristics': plan_checker still tops up a passing plan with the rest of the
+#      year's budget, and 'ml_spend_all_last_cycle_of_year' stays True.
+#      DRL_code.py --year-end-override turns the extra chance back on (ablation).
+#  M23 ABLATION SWITCHES + GATEKEEPER TIMING (all default to the full pipeline):
+#      'ml_trigger'  : 'gatekeeper' (default) | 'heuristic' -> in ML modes, your
+#                      algorithm's own check_need_for_upgrade decides IF (trigger + DRL).
+#      'ml_selector' : 'drl' (default) | 'heuristic' -> after the trigger says yes,
+#                      your heuristic picks WHAT exactly as in ml_mode='off'
+#                      (gatekeeper + incremental). No DRL decision points then.
+#      'ml_time_gatekeeper' : False (default) | True -> in ml_mode='off', each
+#                      upgrade check also asks the gatekeeper on the same state and
+#                      records both answers and both run times in
+#                      state['gatekeeper_timing'] (DRL_code.py --time-gatekeeper).
+#                      The heuristic run itself is unchanged: the gatekeeper is only
+#                      asked, never obeyed.
 #
 #  Decision flow in ML modes:
 #    XGBoost: upgrade needed? --no--> nothing this cycle
@@ -457,7 +477,13 @@ CONFIG = {
     # If True, the year's last cycle becomes a DRL decision point even when the
     # gatekeeper says "no upgrade", as long as budget is left (use it or lose it).
     # False = the gatekeeper's "no" always skips the cycle.
-    'ml_year_end_override_gatekeeper': True,
+    ##############################################################################
+    # ### ML-INTEGRATION CHANGE M22 (Claude) ###
+    # CHANGED default True -> False: the heuristics never get this extra year-end
+    # chance, so the fair comparison leaves it off. Turn it on only as an ablation
+    # (DRL_code.py --year-end-override).
+    ##############################################################################
+    'ml_year_end_override_gatekeeper': False,
     # In such an override cycle: False = the DRL DECIDES whether to spend (it may skip);
     # True = it must spend whatever fits.
     'ml_year_end_override_forces_spend': False,
@@ -482,6 +508,20 @@ CONFIG = {
     # 'xgboost' -> XGBoost gatekeeper (error if JSON missing)
     # 'always'  -> every upgrade cycle is a decision point (agent can still pass)
     'ml_train_gatekeeper': 'auto',
+
+    ##############################################################################
+    # ### ML-INTEGRATION CHANGE M23 (Claude) ###
+    # ADDED: ablation switches (defaults = full pipeline) and the gatekeeper timing check.
+    ##############################################################################
+    # Who decides IF in ML modes: 'gatekeeper' (XGBoost) or 'heuristic' (your algorithm's
+    # check_need_for_upgrade, as in ml_mode='off') -> "trigger + DRL" ablation.
+    'ml_trigger': 'gatekeeper',
+    # Who decides WHAT in ML modes: 'drl' or 'heuristic' (your ml_base_algorithm's link
+    # selection and plan, as in ml_mode='off') -> "gatekeeper + incremental" ablation.
+    'ml_selector': 'drl',
+    # ml_mode='off' only: also ask the gatekeeper at every upgrade check and record both
+    # answers and run times (does not change the heuristic run).
+    'ml_time_gatekeeper': False,
 
     # # Allowed daily OPEX budget = factor × initial daily OPEX
     # 'opex_budget_factor': 3,
@@ -584,6 +624,24 @@ def get_ml_mode(config: Dict[str, Any]) -> str:
     return mode
 
 
+##############################################################################
+# ### ML-INTEGRATION CHANGE M23 (Claude) ###
+# NEW: validated readers for the ablation switches.
+##############################################################################
+def get_ml_trigger(config: Dict[str, Any]) -> str:
+    v = str(config.get("ml_trigger", "gatekeeper")).lower()
+    if v not in ("gatekeeper", "heuristic"):
+        raise ValueError(f"CONFIG['ml_trigger'] must be 'gatekeeper' or 'heuristic', got {v!r}")
+    return v
+
+
+def get_ml_selector(config: Dict[str, Any]) -> str:
+    v = str(config.get("ml_selector", "drl")).lower()
+    if v not in ("drl", "heuristic"):
+        raise ValueError(f"CONFIG['ml_selector'] must be 'drl' or 'heuristic', got {v!r}")
+    return v
+
+
 def get_run_label(config: Dict[str, Any]) -> str:
     """Results-folder label: heuristic name, or ml_train / ml_deploy.
     M19: an optional CONFIG['ml_run_tag'] is appended so parallel training / evaluation
@@ -667,7 +725,8 @@ def gatekeeper_for_mode(config: Dict[str, Any]):
     """Return the gatekeeper model to use, or None for 'always upgrade-check'."""
     mode = get_ml_mode(config)
     if mode == "off":
-        return None
+        # M23: the timing check asks (never obeys) the gatekeeper in heuristic runs
+        return load_gatekeeper(config["ml_gatekeeper_path"]) if config.get("ml_time_gatekeeper") else None
     if mode == "deploy":
         return load_gatekeeper(config["ml_gatekeeper_path"])
 
@@ -2045,6 +2104,7 @@ def initialize_simulation_state(config: Dict[str, Any]) -> Dict[str, Any]:
         "pending_drl_decision": None,
         "drl_decision_log": [],
         "last_drl_result": None,
+        "gatekeeper_timing": [],      # M23: filled only when CONFIG['ml_time_gatekeeper']
         "config": config,
         "algorithm": algorithm,
         "results_dir": results_dir,
@@ -2549,11 +2609,14 @@ def run_single_cycle(state: Dict[str, Any], action: Optional[Any] = None) -> Tup
         # - ML modes: XGBoost gatekeeper on the RAW feature row decides upgrade_needed
         ##############################################################################
         ml_mode = get_ml_mode(config)
+        ml_trigger = get_ml_trigger(config)                # M23
+        ml_selector = get_ml_selector(config)              # M23
 
         print(">>> Checking whether upgrade is needed...")
         gatekeeper_prob = None
         gatekeeper_overridden = False                      # M16/M17 year-end override
-        if ml_mode == "off":
+        if ml_mode == "off" or ml_trigger == "heuristic":  # M23: heuristic trigger in ML modes too
+            _t_heur = time.perf_counter()
             upgrade_needed = algorithm.check_need_for_upgrade(
                 current_traffic=traffic_rates,
                 current_time=Current_global_time,
@@ -2562,6 +2625,31 @@ def run_single_cycle(state: Dict[str, Any], action: Optional[Any] = None) -> Tup
                 current_link_status_backward=copy.deepcopy(link_status_backward),
                 seed=seed
             )
+            _t_heur = time.perf_counter() - _t_heur
+            ##############################################################################
+            # ### ML-INTEGRATION CHANGE M23 (Claude) ###
+            # NEW: timing check. Ask (do not obey) the gatekeeper on the same state.
+            ##############################################################################
+            if (ml_mode == "off" and config.get("ml_time_gatekeeper")
+                    and state.get("gatekeeper") is not None):
+                _t_gk = time.perf_counter()
+                _gk_row = build_feature_row(
+                    current_bbp=metrics.get_blocking_probability(),
+                    traffic_rates=traffic_rates,
+                    link_status_forward=link_status_forward,
+                    link_ids=state["drl_link_ids"],
+                )
+                _gk_says, _gk_prob = gatekeeper_predict(
+                    state["gatekeeper"], _gk_row,
+                    threshold=float(config.get("ml_gatekeeper_threshold", 0.5)),
+                )
+                _t_gk = time.perf_counter() - _t_gk
+                state["gatekeeper_timing"].append({
+                    "cycle": int(current_upgrade), "day": float(Current_global_time),
+                    "heuristic_says": bool(upgrade_needed), "heuristic_seconds": _t_heur,
+                    "gatekeeper_says": bool(_gk_says), "gatekeeper_prob": float(_gk_prob),
+                    "gatekeeper_seconds": _t_gk,
+                })
         else:
             # XGBoost gatekeeper on the RAW feature row (same scale as its training CSV)
             feature_row = build_feature_row(
@@ -2616,7 +2704,7 @@ def run_single_cycle(state: Dict[str, Any], action: Optional[Any] = None) -> Tup
             # If there are no candidate links, nothing is upgraded this cycle.
             # REMOVED: the old `config['algorithm'] == 'drl'` branch.
             ##############################################################################
-            if ml_mode != "off":
+            if ml_mode != "off" and ml_selector == "drl":            # M23: selector switch
                 # Candidate links come from main.py's hard-coded selection (same as heuristics).
                 _sync_to_state()
                 candidates = drl_candidate_links(state, sd_last_block_prob)
@@ -2645,9 +2733,12 @@ def run_single_cycle(state: Dict[str, Any], action: Optional[Any] = None) -> Tup
                 # logic is identical; verified connection-by-connection against your
                 # original main.py on the same seed.
                 ##############################################################################
+                # M23: also the "gatekeeper + incremental" ablation (ML mode, ml_selector='heuristic'),
+                # which uses ml_base_algorithm, the algorithm object loaded in ML modes.
                 _sync_to_state()
+                _algo_key = config['algorithm'] if ml_mode == "off" else config.get('ml_base_algorithm', 'increment')
                 plan_ok, final_links, final_upgrade_decisions = run_heuristic_upgrade(
-                    state, config['algorithm'], algorithm, sd_last_block_prob
+                    state, _algo_key, algorithm, sd_last_block_prob
                 )
                 if plan_ok:
                     commit_upgrade_plan(state, final_links, final_upgrade_decisions, period_index)
@@ -2875,7 +2966,8 @@ def run_simulation(config: Dict[str, Any]):
         )
 
     # Load the DRL policy before building the state, so a missing file fails fast.
-    drl_policy = load_drl_policy(config["ml_drl_policy_path"]) if ml_mode == "deploy" else None
+    drl_policy = (load_drl_policy(config["ml_drl_policy_path"])
+                  if ml_mode == "deploy" and get_ml_selector(config) == "drl" else None)   # M23
 
     # 1. Initialize simulation state
     state = initialize_simulation_state(config)

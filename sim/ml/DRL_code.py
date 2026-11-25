@@ -12,10 +12,10 @@ every Upgrade_initiation_days (180), so the environment works like this:
        sequential downtime, or it STOPs early to save budget for later in the
        same year (not allowed in the year's last cycle).
     -> main.apply_drl_decision() sends the WHOLE selection to plan_checker once:
-           PASS -> commit;  FAIL -> nothing spent, penalty, cycle falls back to incremental
+           PASS -> commit;  FAIL -> nothing spent, small penalty, cycle falls back to incremental
     -> run connection events until the next decision point
        or until the network's lifetime ends (BBP threshold reached)
-    -> observe, reward (given once per cycle; intermediate picks get 0)
+    -> observe, reward (given once per cycle; intermediate picks get 0; see CycleReward, D20)
 The agent never calls plan_checker itself. The action mask (main.compute_drl_action_mask)
 only allows picks that keep the whole selection within the CAPEX/TOTAL budget and the
 downtime limit and keep the network connected.
@@ -23,10 +23,11 @@ downtime limit and keep the network connected.
 Usage (run from the repository root or from sim/ml)
 -----
     python sim/ml/DRL_code.py --check                      # quick smoke test (no training)
-    python sim/ml/DRL_code.py --n-envs 4 --max-cycles 4 --time-limit-minutes 60   # timing test
+    python sim/ml/DRL_code.py --n-envs 4 --max-decisions 4 --time-limit-minutes 60   # timing test
     python sim/ml/DRL_code.py --timesteps 50000 --n-envs 4 # train with 4 simulators in parallel
     python sim/ml/DRL_code.py --resume sim/ml/drl_optical_policy.zip --timesteps 20000
     python sim/ml/DRL_code.py --evaluate sim/ml/drl_optical_policy.zip   # vs random + incremental
+    python sim/ml/DRL_code.py --evaluate sim/ml/drl_optical_policy.zip --eval-heuristics greedy,jump_to_max
 """
 
 # ##############################################################################
@@ -63,7 +64,8 @@ Usage (run from the repository root or from sim/ml)
 #      step runs the simulator until the next real decision point. Cycles
 #      where no candidate is feasible are resolved automatically.
 #  D6  _calculate_reward(): same values as yours, driven by the result status
-#      from main.apply_drl_decision (executed / rejected / pass).
+#      from main.apply_drl_decision (executed / rejected / pass). Replaced by
+#      CycleReward in D20 (your values kept as --reward legacy).
 #  D7  reset(): closes the previous episode's 4 CSV handles (was leaking),
 #      cycles through training seeds (SB3 passes seed=None after the first
 #      reset, so every episode used seed 0).
@@ -141,6 +143,68 @@ Usage (run from the repository root or from sim/ml)
 #        False for runs stopped by a day or cycle cap.
 #      - Old monitor / validation CSVs with the previous columns are renamed
 #        (*.pre_D19) instead of being appended to with mismatched columns.
+#  D20 NEW REWARD (CycleReward) + FAIR COMPARISON SETTINGS:
+#      - Old reward: 10 x (1 - cumulative BBP) - 5 per upgrade, -100 on a
+#        plan_checker reject, -10000 at end of life. Cumulative BBP is ~0.003 for
+#        most of the lifetime, so every cycle scored ~5 whatever the agent did,
+#        and the -10000 spike was 2000x a normal cycle. Kept as --reward legacy
+#        (ablation only).
+#      - New reward, once per finished cycle (picks inside a cycle still get 0):
+#          r = (days / 180) * max(1 - w / threshold, floor)
+#              - lambda * (cost added / B) - kappa * [fallback used]
+#        w = blocking in THIS window only (blocked / arrived since the agent's
+#        last decision); threshold = CONFIG['blocking_threshold'] (0.1);
+#        floor = -3; cost added = change in total_network_cost (CAPEX +
+#        workforce + OPEX, including any fallback spending); B = half of year 0's
+#        total budget (one cycle's share); fallback = the cycle was handed to
+#        incremental (rejected or nothing selected). Summed over an episode, the
+#        first term is the network's lifetime in cycles (minus blocking), so the
+#        agent maximises what the paper reports. No extra end-of-life penalty:
+#        ending early already loses every later +1.
+#      - Defaults = the conference setting: lambda 0 (year-end spending is on, as
+#        for the heuristics, so leftover money is use-it-or-lose-it and spending it
+#        costs nothing extra), kappa 0.5 (big enough that handing cycles to
+#        incremental on purpose does not pay, small enough not to make the agent
+#        timid), floor -3. JOCN: --no-spend-all-last-cycle with --reward-lambda.
+#      - Discount 0.999 (was 0.99): gamma applies per PICK, so with 0.99 a
+#        15-pick cycle shrank the future 14% and a 2-pick cycle 2%; the number of
+#        picks should not change how much the future counts. Entropy bonus 0.01
+#        so the policy keeps exploring the 361 actions early on.
+#      - Spending settings passed to every simulator (also the parallel ones):
+#        --year-end-override (main.py M22 turned it off by default: the
+#        heuristics never get that extra chance) and --no-spend-all-last-cycle.
+#      - --max-decisions N: a training episode ends after the agent's N-th upgrade
+#        decision. With the year-end override off, the gatekeeper can say "no" for
+#        the first several calendar cycles, so --max-cycles 4 could end every
+#        episode before the agent ever acts. --max-decisions always waits for the
+#        first decision; use it for the curriculum (4 -> 8 -> none).
+#      - Training settings are saved next to the policy (<policy>.settings.json);
+#        --evaluate warns if its settings differ.
+#      - --evaluate scores EVERY method with the same reward (DRL, random agent,
+#        incremental, plus any --eval-heuristics), 180-day windows, so you can
+#        check the reward ranks the heuristics sensibly before training. Also
+#        reports fallbacks and days per $1M. Runs to the lifetime threshold
+#        unless --eval-max-days / --eval-max-cycles are given.
+#  D21 ABLATIONS, PARALLEL RUNS, GATEKEEPER TIMING:
+#      - Every conference ablation is a flag (sets main.py CONFIG for this run and
+#        all its worker processes; nothing to edit by hand):
+#          --trigger heuristic        your trigger decides IF, DRL decides WHAT
+#          --gatekeeper-threshold 0   DRL alone (every cycle reaches it; it may save)
+#          --upgrade-levels increment DRL with a fixed upgrade step
+#          --no-early-stop            budget saving off
+#        and --eval-gatekeeper-incremental adds the "gatekeeper + incremental"
+#        baseline to --evaluate (main.py M23 ml_selector='heuristic').
+#      - --out-dir DIR: the policy, logs and checkpoints of this run go under DIR,
+#        and its simulator result folders (in results/) are named after DIR, so
+#        several runs can train at once on the cluster without overwriting each
+#        other. --baseline-cache shares the
+#        heuristic results between runs; --eval-json writes the results table.
+#      - Heuristic baselines (incremental, --eval-heuristics) no longer depend on
+#        the ML settings in the cache key, so every run reuses them.
+#      - --time-gatekeeper: runs incremental on the given seeds and, at every
+#        upgrade check, also asks the gatekeeper (never obeys it). Prints how often
+#        they agree and how long each takes (the gatekeeper's speed claim).
+#      - run_experiments.py (next to this file) chains everything per variant.
 # ##############################################################################
 
 import sys
@@ -205,6 +269,92 @@ VALIDATION_SEEDS = (12, 13, 14)
 TEST_SEEDS = (15, 16, 17, 18, 19)
 
 
+##############################################################################
+# ### ML-INTEGRATION CHANGE D20 (Claude) ###
+# NEW: the reward, in one place, used by training AND by --evaluate (so every
+# method is scored the same way). See the D20 log at the top for the reasoning.
+##############################################################################
+REWARD_DEFAULTS = {"mode": "window", "lam": 0.0, "kappa": 0.5, "floor": -3.0}
+
+
+class CycleReward:
+    """Per-cycle reward.
+
+    window (default):
+        r = (days / cycle_days) * max(1 - w / threshold, floor)
+            - lam * (cost added / B) - kappa * [fallback used]
+    legacy (ablation only): the original 10 * (1 - cumulative BBP) - 5 per upgrade,
+        -100 on a plan_checker reject, -10000 at the end of the lifetime.
+
+    start(state) marks the beginning of a window; window(state) measures everything
+    since then and starts the next window.
+    """
+
+    def __init__(self, mode="window", lam=0.0, kappa=0.5, floor=-3.0,
+                 terminal_penalty=-10000.0, action_cost_penalty=5.0, invalid_action_penalty=-100.0):
+        if mode not in ("window", "legacy"):
+            raise ValueError(f"unknown reward mode {mode!r} (use 'window' or 'legacy')")
+        self.mode = mode
+        self.lam = float(lam)
+        self.kappa = float(kappa)
+        self.floor = float(floor)
+        self.terminal_penalty = float(terminal_penalty)
+        self.action_cost_penalty = float(action_cost_penalty)
+        self.invalid_action_penalty = float(invalid_action_penalty)
+        self._snap = None
+
+    def settings(self):
+        return {"reward": self.mode, "reward_lambda": self.lam,
+                "reward_kappa": self.kappa, "reward_floor": self.floor}
+
+    @staticmethod
+    def budget_ref(state):
+        """B: one cycle's share of year 0's total budget (the budget is per year, 2 cycles a year)."""
+        return float(state["budget_params"]["period_total_budget_0"]) / 2.0
+
+    @staticmethod
+    def _read(state):
+        m = state["metrics"]
+        return (float(state["Current_global_time"]), int(m.connection_count),
+                int(m.blocked_connection_count), float(state["total_network_cost"]))
+
+    def start(self, state):
+        self._snap = self._read(state)
+
+    def window(self, state):
+        """Everything since the last start()/window(), then start the next window."""
+        now = self._read(state)
+        t0, n0, b0, c0 = self._snap if self._snap is not None else now
+        self._snap = now
+        days = max(now[0] - t0, 0.0)
+        arrivals, blocked, spent = now[1] - n0, now[2] - b0, now[3] - c0
+        threshold = float(state["config"]["blocking_threshold"])
+        cycle_days = float(state["budget_params"]["period_days"])
+        w = blocked / arrivals if arrivals > 0 else 0.0
+        life = (days / cycle_days) * max(1.0 - w / threshold, self.floor)
+        return {"days": days, "window_bbp": w, "life": life,
+                "cost": spent / self.budget_ref(state), "spent": spent}
+
+    def total(self, life, cost, fallbacks):
+        """Reward for already-measured parts (also used to score whole evaluation runs)."""
+        return float(life) - self.lam * float(cost) - self.kappa * float(fallbacks)
+
+    def cycle_reward(self, state, result, terminated):
+        """Reward for the cycle the agent just finished (result = apply_drl_decision's result)."""
+        comp = self.window(state)
+        comp["fallback"] = result.get("fallback") is not None
+        if self.mode == "legacy":
+            if terminated:
+                return self.terminal_penalty, comp
+            r = (1.0 - float(state["metrics"].get_blocking_probability())) * 10.0
+            if result["status"] == "executed":
+                r -= self.action_cost_penalty
+            elif result["status"].startswith("rejected"):
+                r += self.invalid_action_penalty
+            return r, comp
+        return self.total(comp["life"], comp["cost"], int(comp["fallback"])), comp
+
+
 # =====================================================================
 # Environment
 # =====================================================================
@@ -229,9 +379,13 @@ class OpticalNetworkEnv(gym.Env):
         run_tag=None,                        # D17: own results folder per parallel simulator
         max_decisions_per_episode=None,      # optional truncation (counts DRL decisions)
         max_cycles=None,                     # D19: stop the episode after upgrade cycle N
-        terminal_penalty=-10000.0,
-        action_cost_penalty=5.0,
-        invalid_action_penalty=-100.0,       # DRL's selection failed plan_checker (cycle falls back to incremental)
+        reward_mode=REWARD_DEFAULTS["mode"],    # D20: 'window' (new) or 'legacy' (old, ablation)
+        reward_lambda=REWARD_DEFAULTS["lam"],   # D20: weight on money spent (0 = conference setting)
+        reward_kappa=REWARD_DEFAULTS["kappa"],  # D20: penalty when the cycle falls back to incremental
+        reward_floor=REWARD_DEFAULTS["floor"],  # D20: lowest value of the lifetime term per cycle
+        terminal_penalty=-10000.0,           # legacy reward only
+        action_cost_penalty=5.0,             # legacy reward only
+        invalid_action_penalty=-100.0,       # legacy reward only
     ):
         super().__init__()
         self.sim_config = copy.deepcopy(sim_config)
@@ -248,9 +402,10 @@ class OpticalNetworkEnv(gym.Env):
         self.quiet = quiet
         self.max_decisions_per_episode = max_decisions_per_episode
         self.max_cycles = int(max_cycles) if max_cycles else None
-        self.terminal_penalty = float(terminal_penalty)
-        self.action_cost_penalty = float(action_cost_penalty)
-        self.invalid_action_penalty = float(invalid_action_penalty)
+        self.reward = CycleReward(mode=reward_mode, lam=reward_lambda, kappa=reward_kappa,
+                                  floor=reward_floor, terminal_penalty=terminal_penalty,
+                                  action_cost_penalty=action_cost_penalty,
+                                  invalid_action_penalty=invalid_action_penalty)    # D20
 
         self.sim_state = None
         self.decisions_this_episode = 0
@@ -336,22 +491,11 @@ class OpticalNetworkEnv(gym.Env):
         return float(self.sim_state["metrics"].get_blocking_probability())
 
     ##############################################################################
-    # ### ML-INTEGRATION CHANGE D6 (Claude) ###
-    # CHANGED: same reward values as your version; uses the status returned by
-    # main.apply_drl_decision and the simulator's own termination (lifetime end)
-    # instead of a separate 0.01 bbp_threshold. Given once per CYCLE (when the
-    # selection is finalized); intermediate picks get 0.
+    # ### ML-INTEGRATION CHANGE D6 / D20 (Claude) ###
+    # The reward now lives in CycleReward (above the class), shared with --evaluate.
+    # REMOVED: _calculate_reward() with the old values (still available as
+    # reward_mode='legacy').
     ##############################################################################
-    def _calculate_reward(self, bbp, result, terminated):
-        if terminated:
-            return self.terminal_penalty
-        reward = (1.0 - bbp) * 10.0
-        status = result["status"]
-        if status == "executed":
-            reward -= self.action_cost_penalty
-        elif status.startswith("rejected"):
-            reward += self.invalid_action_penalty
-        return reward
 
     # ------------------------------------------------------------------
     # Gym API
@@ -379,6 +523,7 @@ class OpticalNetworkEnv(gym.Env):
             self.decisions_this_episode = 0
             ended = self._advance_to_decision()
             if not ended:
+                self.reward.start(self.sim_state)          # D20: first reward window starts here
                 return self._observe(), {"sim_seed": sim_seed, "bbp": self._bbp(),
                                          "day": float(self.sim_state["Current_global_time"])}
             close_state_files(self.sim_state)
@@ -386,8 +531,8 @@ class OpticalNetworkEnv(gym.Env):
         raise RuntimeError(
             "No upgrade decision point was reached for any training seed (the network hit its BBP "
             "threshold, or the --max-cycles limit came first because the gatekeeper said 'no' "
-            "every cycle). Try a larger --max-cycles, or check Upgrade_initiation_days / the "
-            "gatekeeper threshold."
+            "every cycle). Use --max-decisions instead of --max-cycles (it always waits for the "
+            "first decision), or a larger --max-cycles."
         )
 
     ##############################################################################
@@ -414,7 +559,8 @@ class OpticalNetworkEnv(gym.Env):
                     "cycle_complete": False, "selected_links": result["selected_links"],
                     "selected_levels": result["selected_levels"],
                     "status": "picking", "fallback": None, "final_links": [],
-                    "lifetime_ended": False}
+                    "lifetime_ended": False,
+                    "total_cost": float(self.sim_state["total_network_cost"])}
             return self._observe(), 0.0, False, False, info
 
         self.decisions_this_episode += 1
@@ -422,7 +568,7 @@ class OpticalNetworkEnv(gym.Env):
         cut = ended and self._cut_by_cycle_limit           # D19: --max-cycles reached
         terminated = ended and not cut                       # real end of the network's lifetime
         bbp = self._bbp()
-        reward = self._calculate_reward(bbp, result, terminated)
+        reward, parts = self.reward.cycle_reward(self.sim_state, result, terminated)   # D20
 
         truncated = bool(
             not terminated
@@ -440,6 +586,9 @@ class OpticalNetworkEnv(gym.Env):
             "fallback": result["fallback"],
             "final_links": result["final_links"],
             "lifetime_ended": bool(terminated),        # D19: False when cut off by --max-cycles
+            "total_cost": float(self.sim_state["total_network_cost"]),            # D20
+            "window_bbp": parts["window_bbp"], "reward_life": parts["life"],      # D20
+            "reward_cost": parts["cost"], "spent": parts["spent"],
         }
         return self._observe(), float(reward), terminated, truncated, info
 
@@ -497,7 +646,8 @@ def run_smoke_test(env, n_decisions=5):
         picked = ", ".join(f"{l}:{info['selected_levels'][l]}" for l in info["selected_links"])
         print(f"  cycle {cycles}: picked [{picked}] ({picks} picks) -> {info['status']}"
               f"{' | fallback ' + info['fallback'] if info['fallback'] else ''}, "
-              f"reward={reward:.2f}, bbp={info['bbp']:.5f}, day={info['day']:.1f}")
+              f"reward={reward:.3f} (lifetime {info['reward_life']:.3f}, cost {info['reward_cost']:.3f}, "
+              f"window BBP {info['window_bbp']:.5f}), bbp={info['bbp']:.5f}, day={info['day']:.1f}")
         picks = 0
         if terminated or truncated:
             print("  episode ended")
@@ -588,7 +738,7 @@ def plot_training_curves(log_dir):
     ax2.plot(results_df['timesteps'], results_df['day'], color='lightgreen', alpha=0.4, label='Raw Network Lifetime')
     ax2.plot(results_df['timesteps'], results_df['smoothed_lifetime'], color='darkgreen', linewidth=2, label='Moving Average Lifetime')
     if cut_off:   # D19
-        ax2.set_title('Day at episode end (episodes cut off by --max-cycles, so not full lifetimes)',
+        ax2.set_title('Day at episode end (episodes cut off by --max-decisions/--max-cycles, not full lifetimes)',
                       fontsize=12, fontweight='bold')
     else:
         ax2.set_title('Network Lifetime (days until BBP crosses threshold)', fontsize=12, fontweight='bold')
@@ -715,12 +865,12 @@ def _mask_fn(env):
     return env.action_masks()
 
 
-MONITOR_KEYWORDS = ("bbp", "day", "lifetime_ended")       # D19: + lifetime_ended
+MONITOR_KEYWORDS = ("bbp", "day", "lifetime_ended", "total_cost")   # D19: + lifetime_ended; D20: + total_cost
 
 
 def _set_aside_if_columns_differ(path, expected_columns):
     """D19: a CSV written by an older version has different columns; appending to it
-    would corrupt it. Rename it to <name>.pre_D19 (kept, but no longer read) instead."""
+    would corrupt it. Rename it to <name>.old (kept, but no longer read) instead."""
     if not os.path.exists(path):
         return
     try:
@@ -731,21 +881,27 @@ def _set_aside_if_columns_differ(path, expected_columns):
     except Exception:
         columns = []
     if columns != list(expected_columns):
-        old = path + ".pre_D19"
+        old = path + ".old"
         if os.path.exists(old):
             os.remove(old)
         os.replace(path, old)
         print(f"Note: {os.path.basename(path)} had older columns; kept as {os.path.basename(old)}.")
 
 
-def make_training_env(rank, quiet, log_dir, override_existing, n_envs, max_cycles=None):
+def make_training_env(rank, quiet, log_dir, override_existing, n_envs, max_cycles=None,
+                      sim_overrides=None, reward_kwargs=None, max_decisions=None, tag_prefix=""):
     """One training simulator: OpticalNetworkEnv -> ActionMasker -> Monitor (top level so it
-    can be sent to worker processes)."""
+    can be sent to worker processes). D20: sim_overrides (spending settings) and the reward
+    settings are passed in explicitly, because a worker process re-imports main.py and would
+    otherwise see the default CONFIG."""
     from stable_baselines3.common.monitor import Monitor
     from sb3_contrib.common.wrappers import ActionMasker
-    env = OpticalNetworkEnv(sim_config=CONFIG, quiet=quiet,
-                            run_tag=(f"train_env{rank}" if n_envs > 1 else None),
-                            max_cycles=max_cycles)                      # D19
+    sim_config = dict(CONFIG, **(sim_overrides or {}))
+    env = OpticalNetworkEnv(sim_config=sim_config, quiet=quiet,
+                            run_tag=(f"{tag_prefix}train_env{rank}" if (n_envs > 1 or tag_prefix) else None),
+                            max_cycles=max_cycles,                       # D19
+                            max_decisions_per_episode=max_decisions,     # D20
+                            **(reward_kwargs or {}))                     # D20
     env = ActionMasker(env, _mask_fn)
     monitor_path = (os.path.join(log_dir, "monitor.csv") if n_envs == 1
                     else os.path.join(log_dir, f"env{rank}.monitor.csv"))
@@ -757,27 +913,62 @@ def make_training_env(rank, quiet, log_dir, override_existing, n_envs, max_cycle
                    override_existing=override_existing)
 
 
+##############################################################################
+# ### ML-INTEGRATION CHANGE D17 / D19 / D20 (Claude) ###
+# D20: every method is scored with the SAME reward (CycleReward) over fixed 180-day
+# windows, so the reward can be checked on the heuristics before any training.
+# Extra heuristics via --eval-heuristics; spending settings passed to every worker.
+##############################################################################
+def _settings_tag(sim_overrides, floor, method=None):
+    """Cache key for a baseline row. D21: the heuristic baselines (incremental, heuristic_*)
+    do not use any ML setting, so only the reward floor is part of their key."""
+    if method is not None and (method == "incremental" or method.startswith("heuristic_")):
+        return f"floor={float(floor):g}"
+    merged = {k: CONFIG.get(k) for k in ML_SETTING_KEYS}
+    merged.update(sim_overrides or {})
+    return ";".join(f"{k.replace('ml_', '')}={merged[k]}" for k in ML_SETTING_KEYS) + f";floor={float(floor):g}"
+
+
+ML_SETTING_KEYS = ("ml_year_end_override_gatekeeper", "ml_spend_all_last_cycle_of_year", "ml_trigger",
+                   "ml_gatekeeper_threshold", "ml_upgrade_levels", "ml_allow_early_stop")
+
+
 def _evaluate_one(job):
-    """Run ONE full network lifetime for (method, seed). method: 'drl' | 'random' | 'incremental'."""
-    method, seed, policy_path, max_days, max_cycles, quiet = job
+    """Run ONE network lifetime for job['method'] on job['seed'].
+    method: 'drl' | 'random' (random agent, same choices and masks as the DRL) |
+            'incremental' | 'heuristic_<name>' (any of Akansha's algorithms) |
+            'gatekeeper_incremental' (D21 ablation)."""
+    import math
     import time
-    cfg = copy.deepcopy(CONFIG)
-    cfg.update(seed=int(seed), collect_xgboost_data=False, ml_run_tag=f"eval_{method}_s{seed}")
+    method, seed = job["method"], int(job["seed"])
+    max_days, max_cycles = job.get("max_days"), job.get("max_cycles")
+    cfg = dict(copy.deepcopy(CONFIG), **(job.get("sim_overrides") or {}))
+    cfg.update(seed=seed, collect_xgboost_data=False,
+               ml_run_tag=f"{job.get('tag_prefix', '')}eval_{method}_s{seed}")
     cfg["max_upgrade_cycles_for_debug"] = int(max_cycles) if max_cycles else None   # D19 (main.py M21)
     if method == "incremental":
         cfg.update(ml_mode="off", algorithm="increment")
+    elif method.startswith("heuristic_"):
+        cfg.update(ml_mode="off", algorithm=method[len("heuristic_"):])
+    elif method == "gatekeeper_incremental":          # D21: gatekeeper decides IF, incremental WHAT
+        cfg.update(ml_mode="train", ml_selector="heuristic")
     else:
         cfg["ml_mode"] = "train"          # same gatekeeper setting the DRL trains with
     policy = None
     if method == "drl":
         from sb3_contrib import MaskablePPO
-        policy = MaskablePPO.load(policy_path, device="cpu")
-    rng = np.random.default_rng(int(seed))
+        policy = MaskablePPO.load(job["policy_path"], device="cpu")
+    rng = np.random.default_rng(seed)
+    meter = CycleReward(floor=job.get("reward_floor", REWARD_DEFAULTS["floor"]))
     t0 = time.time()
     devnull = open(os.devnull, "w")
-    ctx = contextlib.redirect_stdout(devnull) if quiet else contextlib.nullcontext()
+    ctx = contextlib.redirect_stdout(devnull) if job.get("quiet", True) else contextlib.nullcontext()
+    life = cost_units = 0.0
     with ctx:
         st = initialize_simulation_state(cfg)
+        meter.start(st)
+        cycle_days = float(st["budget_params"]["period_days"])
+        next_edge = cycle_days
         done = False
         while not done:
             st, _, done = run_single_cycle(st)
@@ -793,89 +984,232 @@ def _evaluate_one(job):
                 else:
                     action = int(rng.choice(np.flatnonzero(mask)))
                 apply_drl_decision(st, action)
-            if max_days and st["Current_global_time"] >= float(max_days):
+            now = float(st["Current_global_time"])
+            if now >= next_edge:                    # D20: close a 180-day reward window
+                part = meter.window(st)
+                life += part["life"]
+                cost_units += part["cost"]
+                next_edge = (math.floor(now / cycle_days) + 1) * cycle_days
+            if max_days and now >= float(max_days):
                 break
+        part = meter.window(st)                     # last (partial) window
+        life += part["life"]
+        cost_units += part["cost"]
     close_state_files(st)
     devnull.close()
+    total_cost = float(st["total_network_cost"])
+    days = float(st["Current_global_time"])
     return {
-        "method": method, "seed": int(seed), "max_days": max_days or "",
+        "method": method, "seed": seed, "max_days": max_days or "",
         "max_cycles": max_cycles or "",                                    # D19
+        "settings": _settings_tag(job.get("sim_overrides"), meter.floor, method),  # D20/D21
         # D19: a run stopped by --eval-max-cycles also returns done=True; that is not a lifetime end.
         "lifetime_reached_threshold": bool(done) and not st.get("stopped_by_cycle_limit", False),
-        "days_simulated": round(float(st["Current_global_time"]), 1),
+        "days_simulated": round(days, 1),
         "final_bbp": round(float(st["metrics"].get_blocking_probability()), 6),
-        "total_cost": round(float(st["total_network_cost"]), 2),
+        "total_cost": round(total_cost, 2),
+        "days_per_million": round(days / (total_cost / 1e6), 2) if total_cost > 0 else "",   # D20
         "upgrades_committed": len(st["upgrade_decision_history"]),
+        "fallbacks": sum(1 for d in st.get("drl_decision_log", []) if d.get("fallback") is not None),
+        "reward_life": round(life, 4),                                     # D20
+        "reward_cost_units": round(cost_units, 4),                         # D20 (cost / B)
         "wall_seconds": round(time.time() - t0, 1),
     }
 
 
-EVAL_FIELDS = ["method", "seed", "max_days", "max_cycles", "lifetime_reached_threshold",
-               "days_simulated", "final_bbp", "total_cost", "upgrades_committed", "wall_seconds"]
+EVAL_FIELDS = ["method", "seed", "max_days", "max_cycles", "settings", "lifetime_reached_threshold",
+               "days_simulated", "final_bbp", "total_cost", "days_per_million", "upgrades_committed",
+               "fallbacks", "reward_life", "reward_cost_units", "wall_seconds"]
+RESULT_FIELDS = ["evaluated_at", "policy", "reward_lambda", "reward_kappa", "reward_return"] + EVAL_FIELDS
 
 
-def run_evaluation(policy_path, seeds, max_days, workers, log_dir, quiet=True, max_cycles=None):
-    """Policy vs random vs incremental on `seeds`; writes CSVs and prints a summary table."""
-    import csv, time
+def _settings_path(policy_path):
+    return os.path.splitext(str(policy_path))[0] + ".settings.json"
+
+
+def run_evaluation(policy_path, seeds, max_days, workers, log_dir, quiet=True, max_cycles=None,
+                   heuristics=(), sim_overrides=None, scorer=None, gatekeeper_incremental=False,
+                   baseline_file=None, json_out=None, tag_prefix=""):
+    """Policy vs random agent vs incremental (+ any extra heuristics) on `seeds`.
+    Every method is scored with the same reward. Writes CSVs and prints a summary table."""
+    import csv, json, time
     import multiprocessing as mp
+    scorer = scorer or CycleReward(**REWARD_DEFAULTS)
+    sim_overrides = dict(sim_overrides or {})
     os.makedirs(log_dir, exist_ok=True)
-    base_file = os.path.join(log_dir, "validation_baselines.csv")
+    base_file = baseline_file or os.path.join(log_dir, "validation_baselines.csv")   # D21: shareable
+    if os.path.dirname(base_file):
+        os.makedirs(os.path.dirname(base_file), exist_ok=True)
     res_file = os.path.join(log_dir, "validation_results.csv")
-    # D19: CSVs from the previous version have no max_cycles column -> set them aside.
     _set_aside_if_columns_differ(base_file, EVAL_FIELDS)
-    _set_aside_if_columns_differ(res_file, ["evaluated_at", "policy"] + EVAL_FIELDS)
-    caps = (str(max_days or ""), str(max_cycles or ""))
-    key = lambda r: (r["method"], int(r["seed"]), str(r["max_days"]), str(r["max_cycles"]))
+    _set_aside_if_columns_differ(res_file, RESULT_FIELDS)
+
+    no_drl = str(policy_path).lower() == "none"          # D21: --evaluate none = baselines only
+    # D20: warn when the policy was trained with different settings than this evaluation uses.
+    eval_settings = dict(scorer.settings(),
+                         **{k: sim_overrides.get(k, CONFIG.get(k)) for k in ML_SETTING_KEYS})
+    try:
+        with open(_settings_path(policy_path)) as f:
+            trained = json.load(f)
+        # D21: a setting missing from the file was the main.py default at training time
+        diff = {k: (trained.get(k, CONFIG.get(k)), v) for k, v in eval_settings.items()
+                if trained.get(k, CONFIG.get(k)) != v}
+        if diff:
+            print("WARNING: this evaluation uses different settings than training "
+                  "(setting: trained -> now): " + ", ".join(f"{k}: {a} -> {b}" for k, (a, b) in diff.items()))
+    except (OSError, ValueError):
+        pass
+
+    tag = _settings_tag(sim_overrides, scorer.floor)
+    key = lambda r: (r["method"], int(r["seed"]), str(r["max_days"]), str(r["max_cycles"]), str(r["settings"]))
+    baselines = ["incremental", "random"] + [f"heuristic_{h}" for h in heuristics if h != "increment"]
+    if gatekeeper_incremental:
+        baselines.append("gatekeeper_incremental")                             # D21
+    _caps = lambda m: (str(max_days or ""), str(max_cycles or ""), _settings_tag(sim_overrides, scorer.floor, m))
 
     cached = {}
     if os.path.exists(base_file):
         with open(base_file, newline="") as f:
             for r in csv.DictReader(f):
                 cached[key(r)] = r
-    jobs = [("drl", s, policy_path, max_days, max_cycles, quiet) for s in seeds]
-    for m in ("incremental", "random"):
-        jobs += [(m, s, None, max_days, max_cycles, quiet) for s in seeds
-                 if (m, int(s)) + caps not in cached]
+    common = dict(max_days=max_days, max_cycles=max_cycles, quiet=quiet,
+                  sim_overrides=sim_overrides, reward_floor=scorer.floor, tag_prefix=tag_prefix)
+    jobs = [] if no_drl else [dict(common, method="drl", seed=s, policy_path=policy_path) for s in seeds]
+    for m in baselines:
+        jobs += [dict(common, method=m, seed=s) for s in seeds if (m, int(s)) + _caps(m) not in cached]
 
     workers = max(1, min(workers or os.cpu_count() or 1, len(jobs)))
     print(f"Evaluating on seeds {list(seeds)}: {len(jobs)} simulations on {workers} worker(s) "
-          f"(cached baselines reused: {len(cached)})...")
+          f"(cached baselines reused: {sum(1 for m in baselines for s in seeds if (m, int(s)) + _caps(m) in cached)})...")
+    print(f"Scoring every method with reward lambda={scorer.lam:g}, kappa={scorer.kappa:g}, "
+          f"floor={scorer.floor:g}; settings {tag}.")
     if workers == 1:
         results = [_evaluate_one(j) for j in jobs]
     else:
         with mp.get_context("spawn").Pool(workers) as pool:
             results = pool.map(_evaluate_one, jobs)
 
-    fields = EVAL_FIELDS
     new_base = [r for r in results if r["method"] != "drl"]
     if new_base:
         exists = os.path.exists(base_file)
         with open(base_file, "a", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=fields)
+            w = csv.DictWriter(f, fieldnames=EVAL_FIELDS)
             if not exists:
                 w.writeheader()
             w.writerows(new_base)
-    rows = [r for r in results if r["method"] == "drl"] + [
-        cached[(m, int(s)) + caps] for m in ("incremental", "random") for s in seeds
-        if (m, int(s)) + caps in cached] + new_base
+    rows = [r for r in results if r["method"] == "drl"] + new_base + [
+        cached[(m, int(s)) + _caps(m)] for m in baselines for s in seeds if (m, int(s)) + _caps(m) in cached]
+    for r in rows:
+        r["reward_return"] = round(scorer.total(r["reward_life"], r["reward_cost_units"], r["fallbacks"]), 4)
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     exists = os.path.exists(res_file)
     with open(res_file, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["evaluated_at", "policy"] + fields)
+        w = csv.DictWriter(f, fieldnames=RESULT_FIELDS)
         if not exists:
             w.writeheader()
         for r in rows:
-            w.writerow({"evaluated_at": stamp, "policy": os.path.basename(policy_path), **r})
+            w.writerow({"evaluated_at": stamp, "policy": os.path.basename(policy_path),
+                        "reward_lambda": scorer.lam, "reward_kappa": scorer.kappa,
+                        **{k: r[k] for k in EVAL_FIELDS + ["reward_return"]}})
 
-    print(f"\n{'seed':>5} | {'method':<12} | {'days':>8} | {'hit threshold':>13} | {'final BBP':>9} | {'total cost':>14}")
+    methods = ([] if no_drl else ["drl"]) + baselines
+    head = (f"{'seed':>5} | {'method':<22} | {'days':>7} | {'hit thr.':>8} | {'final BBP':>9} | "
+            f"{'total cost':>13} | {'days/$1M':>8} | {'fallbk':>6} | {'reward':>8}")
+    print("\n" + head + "\n" + "-" * len(head))
+
+    def _line(label, r):
+        dpm = r["days_per_million"]
+        return (f"{label} | {float(r['days_simulated']):>7.0f} | {str(r['lifetime_reached_threshold']):>8} | "
+                f"{float(r['final_bbp']):>9.4f} | {float(r['total_cost']):>13,.0f} | "
+                f"{(f'{float(dpm):.1f}' if dpm not in ('', None) else '-'):>8} | {int(float(r['fallbacks'])):>6} | "
+                f"{float(r['reward_return']):>8.3f}")
     for s in seeds:
-        for m in ("drl", "incremental", "random"):
+        for m in methods:
             r = next(x for x in rows if x["method"] == m and int(x["seed"]) == int(s))
-            print(f"{int(s):>5} | {m:<12} | {float(r['days_simulated']):>8.0f} | {str(r['lifetime_reached_threshold']):>13} | "
-                  f"{float(r['final_bbp']):>9.4f} | {float(r['total_cost']):>14,.0f}")
-    print("(If a run did not hit the lifetime threshold, it was cut off by --eval-max-days or "
-          "--eval-max-cycles: compare final BBP and cost at the same point instead of lifetime.)")
+            print(_line(f"{int(s):>5} | {m:<22}", r))
+    print("-" * len(head))
+    for m in methods:
+        rs = [x for x in rows if x["method"] == m]
+        mean = {k: sum(float(x[k]) for x in rs) / len(rs)
+                for k in ("days_simulated", "final_bbp", "total_cost", "fallbacks", "reward_return")}
+        dpms = [float(x["days_per_million"]) for x in rs if x["days_per_million"] not in ("", None)]
+        mean["days_per_million"] = sum(dpms) / len(dpms) if dpms else ""
+        mean["lifetime_reached_threshold"] = f"{sum(str(x['lifetime_reached_threshold']) == 'True' for x in rs)}/{len(rs)}"
+        print(_line(f"{'mean':>5} | {m:<22}", mean))
+    print("(days/$1M and lifetime only compare fairly when every run hit the threshold. "
+          "If runs were cut off by --eval-max-days or --eval-max-cycles, compare final BBP and "
+          "cost at the same point instead.)")
     print(f"Saved: {res_file}")
+    if json_out:                                                             # D21
+        with open(json_out, "w") as f:
+            json.dump({"policy": str(policy_path), "seeds": [int(x) for x in seeds],
+                       "settings": eval_settings, "rows": rows}, f, indent=2, default=str)
+    return rows
+
+
+##############################################################################
+# ### ML-INTEGRATION CHANGE D21 (Claude) ###
+# NEW: gatekeeper timing check (the paper's speed claim). Runs your incremental
+# heuristic unchanged; at every upgrade check main.py (M23) also asks the gatekeeper.
+##############################################################################
+def _time_gatekeeper_one(job):
+    import time
+    cfg = copy.deepcopy(CONFIG)
+    cfg.update(seed=int(job["seed"]), ml_mode="off", algorithm="increment", ml_time_gatekeeper=True,
+               collect_xgboost_data=False, ml_run_tag=f"{job.get('tag_prefix', '')}gktime_s{job['seed']}")
+    if job.get("threshold") is not None:
+        cfg["ml_gatekeeper_threshold"] = float(job["threshold"])
+    devnull = open(os.devnull, "w")
+    ctx = contextlib.redirect_stdout(devnull) if job.get("quiet", True) else contextlib.nullcontext()
+    with ctx:
+        st = initialize_simulation_state(cfg)
+        done = False
+        while not done:
+            st, _, done = run_single_cycle(st)
+            if job.get("max_days") and float(st["Current_global_time"]) >= float(job["max_days"]):
+                break
+    close_state_files(st)
+    devnull.close()
+    return [dict(r, seed=int(job["seed"])) for r in st["gatekeeper_timing"]]
+
+
+def run_gatekeeper_timing(seeds, max_days, workers, log_dir, quiet=True, threshold=None, tag_prefix=""):
+    import csv
+    import multiprocessing as mp
+    os.makedirs(log_dir, exist_ok=True)
+    jobs = [dict(seed=s, max_days=max_days, quiet=quiet, threshold=threshold, tag_prefix=tag_prefix)
+            for s in seeds]
+    workers = max(1, min(workers or os.cpu_count() or 1, len(jobs)))
+    print(f"Timing the gatekeeper against incremental's own check on seeds {list(seeds)} "
+          f"({'to day ' + str(max_days) if max_days else 'full lifetimes'}, {workers} worker(s))...")
+    if workers == 1:
+        parts = [_time_gatekeeper_one(j) for j in jobs]
+    else:
+        with mp.get_context("spawn").Pool(workers) as pool:
+            parts = pool.map(_time_gatekeeper_one, jobs)
+    rows = [r for p in parts for r in p]
+    out = os.path.join(log_dir, "gatekeeper_timing.csv")
+    with open(out, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["seed", "cycle", "day", "heuristic_says", "gatekeeper_says",
+                                          "gatekeeper_prob", "heuristic_seconds", "gatekeeper_seconds"])
+        w.writeheader()
+        w.writerows(rows)
+    if not rows:
+        print("No upgrade checks happened (runs too short?).")
+        return rows
+    n = len(rows)
+    agree = sum(r["heuristic_says"] == r["gatekeeper_says"] for r in rows)
+    tp = sum(r["heuristic_says"] and r["gatekeeper_says"] for r in rows)
+    fn = sum(r["heuristic_says"] and not r["gatekeeper_says"] for r in rows)
+    fp = sum(r["gatekeeper_says"] and not r["heuristic_says"] for r in rows)
+    h = sum(r["heuristic_seconds"] for r in rows) / n
+    g = sum(r["gatekeeper_seconds"] for r in rows) / n
+    print(f"\nUpgrade checks: {n}")
+    print(f"Agreement with incremental's check: {agree}/{n} = {100.0 * agree / n:.1f}% "
+          f"(gatekeeper missed {fn} upgrades, added {fp} extra; both said yes {tp} times)")
+    print(f"Average time per check: incremental {h:.3f} s, gatekeeper {1000.0 * g:.2f} ms "
+          f"(about {h / g:,.0f}x faster)" if g > 0 else f"Average time: incremental {h:.3f} s")
+    print(f"Saved: {out}")
     return rows
 
 
@@ -912,7 +1246,7 @@ if __name__ == "__main__":
                         help="number of simulators to train with in parallel (one per CPU core)")
     parser.add_argument("--evaluate", default=None, metavar="POLICY_ZIP",
                         help="do not train: compare this saved policy with a random agent and "
-                             "incremental on the validation seeds, then exit")
+                             "incremental on the validation seeds, then exit ('none' = baselines only)")
     parser.add_argument("--val-seeds", default=",".join(str(s) for s in VALIDATION_SEEDS),
                         help="comma-separated validation seeds for --evaluate (default 12,13,14)")
     parser.add_argument("--eval-max-days", type=float, default=None,
@@ -937,23 +1271,137 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=None,
                         help="PPO minibatch size (default: chosen to divide n_steps x n_envs evenly)")
     parser.add_argument("--max-cycles", type=int, default=None,
-                        help="end each training episode after upgrade cycle N (default: full lifetime)")
+                        help="end each training episode after calendar upgrade cycle N (default: full lifetime)")
+    parser.add_argument("--max-decisions", type=int, default=None,
+                        help="end each training episode after the agent's N-th upgrade decision "
+                             "(D20; recommended for the curriculum: 4 -> 8 -> none)")
     parser.add_argument("--progress-minutes", type=float, default=10.0,
                         help="print a progress line every N minutes (0 = off)")
     parser.add_argument("--time-limit-minutes", type=float, default=None,
                         help="stop training cleanly and save after N minutes")
     parser.add_argument("--eval-max-cycles", type=int, default=None,
                         help="with --evaluate: stop each run after upgrade cycle N")
+    ##############################################################################
+    # ### ML-INTEGRATION CHANGE D20 (Claude) ###
+    # NEW: reward, discount and spending options (defaults = the conference setting).
+    # Use the SAME values for training and --evaluate.
+    ##############################################################################
+    parser.add_argument("--reward", choices=("window", "legacy"), default=REWARD_DEFAULTS["mode"],
+                        help="'window' = new reward (default); 'legacy' = the original reward (ablation)")
+    parser.add_argument("--reward-lambda", type=float, default=REWARD_DEFAULTS["lam"],
+                        help="weight on money spent (default 0, the conference setting; JOCN sweep 0.25-2 "
+                             "together with --no-spend-all-last-cycle)")
+    parser.add_argument("--reward-kappa", type=float, default=REWARD_DEFAULTS["kappa"],
+                        help="penalty when a cycle falls back to incremental (default 0.5)")
+    parser.add_argument("--reward-floor", type=float, default=REWARD_DEFAULTS["floor"],
+                        help="lowest value of the lifetime term per cycle (default -3)")
+    parser.add_argument("--gamma", type=float, default=None,
+                        help="discount per pick (default 0.999 for a new run; a resumed run keeps its "
+                             "saved value unless you pass this)")
+    parser.add_argument("--ent-coef", type=float, default=None,
+                        help="entropy bonus that keeps the policy exploring (default 0.01 for a new run)")
+    parser.add_argument("--year-end-override", action="store_true",
+                        help="ablation: the year's last cycle reaches the DRL even when the gatekeeper "
+                             "says no (heuristics never get this chance; off by default)")
+    parser.add_argument("--no-spend-all-last-cycle", action="store_true",
+                        help="JOCN setting: the DRL may also save money in the year's last cycle "
+                             "(default: it must spend what fits, like the heuristics' plan_checker top-up)")
+    parser.add_argument("--eval-heuristics", default="",
+                        help="with --evaluate: extra heuristics to compare, comma-separated "
+                             "(e.g. greedy,jump_to_max,random,no_upgrade)")
+    ##############################################################################
+    # ### ML-INTEGRATION CHANGE D21 (Claude) ###
+    # NEW: ablation flags, per-run output folder, shared baseline cache, JSON results,
+    # gatekeeper timing. Use the same ablation flags for training and --evaluate.
+    ##############################################################################
+    parser.add_argument("--trigger", choices=("gatekeeper", "heuristic"), default=None,
+                        help="who decides IF: the XGBoost gatekeeper (default) or your heuristic's "
+                             "own check (ablation 'trigger + DRL')")
+    parser.add_argument("--gatekeeper-threshold", type=float, default=None,
+                        help="gatekeeper probability needed to upgrade (default 0.5 from main.py); "
+                             "0 = every cycle reaches the DRL (ablation 'DRL alone')")
+    parser.add_argument("--upgrade-levels", choices=("any_higher", "increment"), default=None,
+                        help="any_higher (default) or increment = one fixed step per link "
+                             "(ablation 'fixed upgrade step')")
+    parser.add_argument("--no-early-stop", action="store_true",
+                        help="ablation 'budget saving off': the DRL may not stop early to save money")
+    parser.add_argument("--eval-gatekeeper-incremental", action="store_true",
+                        help="with --evaluate: also run the 'gatekeeper + incremental' ablation")
+    parser.add_argument("--out-dir", default=None,
+                        help="put this run's policy, logs and checkpoints in this folder and name its "
+                             "simulator result folders after it (lets several runs train at once)")
+    parser.add_argument("--baseline-cache", default=None,
+                        help="CSV of saved baseline results to reuse (default: <logs>/validation_baselines.csv)")
+    parser.add_argument("--eval-json", default=None,
+                        help="with --evaluate: also write the results to this JSON file")
+    parser.add_argument("--time-gatekeeper", action="store_true",
+                        help="do not train: run incremental on --val-seeds and compare the gatekeeper's "
+                             "answer and speed with incremental's own check at every upgrade check")
     args = parser.parse_args()
-    for _name in ("n_steps", "batch_size", "max_cycles", "eval_max_cycles"):
+    for _name in ("n_steps", "batch_size", "max_cycles", "max_decisions", "eval_max_cycles"):
         _v = getattr(args, _name)
         if _v is not None and _v < 1:
             parser.error(f"--{_name.replace('_', '-')} must be at least 1")
+    if args.gamma is not None and not 0.0 < args.gamma <= 1.0:
+        parser.error("--gamma must be in (0, 1]")
+    if args.reward_lambda < 0 or args.reward_kappa < 0:
+        parser.error("--reward-lambda and --reward-kappa must be 0 or more")
+    if args.reward_floor > 0:
+        parser.error("--reward-floor must be 0 or less")
+    if args.gatekeeper_threshold is not None and not 0.0 <= args.gatekeeper_threshold <= 1.0:
+        parser.error("--gatekeeper-threshold must be between 0 and 1")
+
+    # D20: settings every simulator gets (explicitly, so the parallel workers see them too)
+    sim_overrides = {"ml_year_end_override_gatekeeper": bool(args.year_end_override),
+                     "ml_spend_all_last_cycle_of_year": not args.no_spend_all_last_cycle}
+    if args.trigger:                                                          # D21 ablations
+        sim_overrides["ml_trigger"] = args.trigger
+    if args.gatekeeper_threshold is not None:
+        sim_overrides["ml_gatekeeper_threshold"] = float(args.gatekeeper_threshold)
+    if args.upgrade_levels:
+        sim_overrides["ml_upgrade_levels"] = "any_higher" if args.upgrade_levels == "any_higher" else ["increment"]
+    if args.no_early_stop:
+        sim_overrides["ml_allow_early_stop"] = False
+
+    # D21: one folder per run (policy, logs, checkpoints, simulator results)
+    if args.out_dir:
+        out_root = os.path.abspath(args.out_dir)
+        log_dir = os.path.join(out_root, "drl_logs")
+        tag_prefix = os.path.basename(out_root.rstrip(os.sep)) + "_"
+    else:
+        out_root = str(_THIS_DIR)
+        log_dir = str(_THIS_DIR / "drl_logs")
+        tag_prefix = ""
+    os.makedirs(log_dir, exist_ok=True)
+    reward_kwargs = {"reward_mode": args.reward, "reward_lambda": args.reward_lambda,
+                     "reward_kappa": args.reward_kappa, "reward_floor": args.reward_floor}
+    scorer = CycleReward(mode=args.reward, lam=args.reward_lambda, kappa=args.reward_kappa,
+                         floor=args.reward_floor)
+    print(f"Reward: {args.reward} (lambda={args.reward_lambda:g}, kappa={args.reward_kappa:g}, "
+          f"floor={args.reward_floor:g}); year-end override "
+          f"{'ON' if args.year_end_override else 'off'}; spend all in the year's last cycle "
+          f"{'off' if args.no_spend_all_last_cycle else 'ON'}.")
+    _abl = {k: v for k, v in sim_overrides.items()
+            if k not in ("ml_year_end_override_gatekeeper", "ml_spend_all_last_cycle_of_year")}
+    if _abl:
+        print(f"Ablation settings: {_abl}")
+
+    if args.time_gatekeeper:                                                   # D21
+        run_gatekeeper_timing([int(s) for s in args.val_seeds.split(",") if s.strip()],
+                              args.eval_max_days, args.eval_workers, log_dir,
+                              quiet=not args.verbose_sim, threshold=args.gatekeeper_threshold,
+                              tag_prefix=tag_prefix)
+        sys.exit(0)
 
     if args.evaluate:
         run_evaluation(args.evaluate, [int(s) for s in args.val_seeds.split(",") if s.strip()],
-                       args.eval_max_days, args.eval_workers, str(_THIS_DIR / "drl_logs"),
-                       quiet=not args.verbose_sim, max_cycles=args.eval_max_cycles)
+                       args.eval_max_days, args.eval_workers, log_dir,
+                       quiet=not args.verbose_sim, max_cycles=args.eval_max_cycles,
+                       heuristics=[h.strip() for h in args.eval_heuristics.split(",") if h.strip()],
+                       sim_overrides=sim_overrides, scorer=scorer,                     # D20
+                       gatekeeper_incremental=args.eval_gatekeeper_incremental,         # D21
+                       baseline_file=args.baseline_cache, json_out=args.eval_json,
+                       tag_prefix=tag_prefix)
         sys.exit(0)
 
     from stable_baselines3.common.vec_env import SubprocVecEnv
@@ -965,7 +1413,8 @@ if __name__ == "__main__":
     ##############################################################################
     if args.check:
         from stable_baselines3.common.env_checker import check_env
-        raw_env = OpticalNetworkEnv(sim_config=CONFIG, quiet=not args.verbose_sim)
+        raw_env = OpticalNetworkEnv(sim_config=dict(CONFIG, **sim_overrides), quiet=not args.verbose_sim,
+                                    **reward_kwargs)                                    # D20
         check_env(raw_env, warn=True)
         print("(smoke test simulates 2 upgrade cycles of real traffic: about 10 minutes)")
         run_smoke_test(raw_env, n_decisions=2)
@@ -973,10 +1422,8 @@ if __name__ == "__main__":
 
     import shutil, time as _time
     run_stamp = _time.strftime("%Y%m%d-%H%M%S")
-    log_dir = str(_THIS_DIR / "drl_logs")
     checkpoint_dir = os.path.join(log_dir, "checkpoints", f"run_{run_stamp}")   # one folder per run
-    os.makedirs(log_dir, exist_ok=True)
-    model_path = str(_THIS_DIR / args.out) if not os.path.isabs(args.out) else args.out
+    model_path = os.path.join(out_root, args.out) if not os.path.isabs(args.out) else args.out   # D21
 
     # A FRESH run (no --resume) must not silently destroy a previously trained policy.
     if args.resume is None and os.path.exists(model_path):
@@ -993,14 +1440,19 @@ if __name__ == "__main__":
     n_envs = max(1, int(args.n_envs))
     quiet = not args.verbose_sim
     if n_envs == 1:
-        env = make_training_env(0, quiet, log_dir, args.resume is None, 1, args.max_cycles)
+        env = make_training_env(0, quiet, log_dir, args.resume is None, 1, args.max_cycles,
+                                sim_overrides, reward_kwargs, args.max_decisions, tag_prefix)   # D20/D21
     else:
         env = SubprocVecEnv([functools.partial(make_training_env, rank, quiet, log_dir,
-                                               args.resume is None, n_envs, args.max_cycles)
+                                               args.resume is None, n_envs, args.max_cycles,
+                                               sim_overrides, reward_kwargs, args.max_decisions,
+                                               tag_prefix)                              # D20/D21
                              for rank in range(n_envs)])
         print(f"Training with {n_envs} parallel simulators.")
     if args.max_cycles:
         print(f"Episodes end after upgrade cycle {args.max_cycles} (--max-cycles).")
+    if args.max_decisions:
+        print(f"Episodes end after {args.max_decisions} upgrade decisions by the agent (--max-decisions).")
 
     ##############################################################################
     # ### ML-INTEGRATION CHANGE D19 (Claude) ###
@@ -1022,23 +1474,40 @@ if __name__ == "__main__":
     ##############################################################################
     if args.resume:
         print(f"Resuming from {args.resume}")
-        custom = None
+        custom = {}
         if args.n_steps is not None or args.batch_size is not None:      # D19: change rollout size on resume
             from sb3_contrib import MaskablePPO as _PPO
             saved = _PPO.load(args.resume, device="cpu")
             n_steps = args.n_steps or int(saved.n_steps)
             del saved
-            custom = {"n_steps": n_steps, "batch_size": _pick_batch(n_steps * n_envs, args.batch_size)}
-        model = MaskablePPO.load(args.resume, env=env, device="cpu", custom_objects=custom)
+            custom.update(n_steps=n_steps, batch_size=_pick_batch(n_steps * n_envs, args.batch_size))
+        if args.gamma is not None:                                       # D20
+            custom["gamma"] = float(args.gamma)
+        if args.ent_coef is not None:                                    # D20
+            custom["ent_coef"] = float(args.ent_coef)
+        model = MaskablePPO.load(args.resume, env=env, device="cpu", custom_objects=custom or None)
         model.set_random_seed(args.seed + int(model.num_timesteps))   # D18: new stream, still reproducible
     else:
         n_steps = args.n_steps or 32                                    # D19: was a fixed 256
-        model = MaskablePPO("MlpPolicy", env, verbose=1, learning_rate=3e-4, gamma=0.99,
+        model = MaskablePPO("MlpPolicy", env, verbose=1, learning_rate=3e-4,
+                            gamma=args.gamma if args.gamma is not None else 0.999,          # D20: was 0.99
+                            ent_coef=args.ent_coef if args.ent_coef is not None else 0.01,  # D20: was 0
                             n_steps=n_steps, batch_size=_pick_batch(n_steps * n_envs, args.batch_size),
                             seed=args.seed)   # D18: seed
     steps_per_update = int(model.n_steps) * n_envs                     # D19
     print(f"PPO learns after every {int(model.n_steps)} x {n_envs} = {steps_per_update} steps "
-          f"(minibatch {int(model.batch_size)}).")
+          f"(minibatch {int(model.batch_size)}, gamma {float(model.gamma):g}, "
+          f"entropy bonus {float(model.ent_coef):g}).")
+
+    # D20: record the settings next to the policy so --evaluate can check it uses the same ones.
+    import json as _json
+    _settings = dict(scorer.settings(), **sim_overrides, gamma=float(model.gamma),
+                     ent_coef=float(model.ent_coef), max_cycles=args.max_cycles,
+                     max_decisions=args.max_decisions,
+                     n_envs=n_envs, n_steps=int(model.n_steps), seed=args.seed,
+                     resumed_from=args.resume, started=run_stamp)
+    with open(_settings_path(model_path), "w") as _f:
+        _json.dump(_settings, _f, indent=2)
 
     ##############################################################################
     # ### ML-INTEGRATION CHANGE D14 (Claude) ###
